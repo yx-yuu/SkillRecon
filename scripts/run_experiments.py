@@ -167,7 +167,7 @@ def _resolve_dataset_inputs(
         gold_label_path = paper_dataset / "gold_labels.jsonl"
     if not gold_label_path.is_file():
         parser.error(
-            f"Missing gold labels at {gold_label_path}. "
+            f"Missing AI-generated gold labels at {gold_label_path}. "
             "Run scripts/prepare_paper_dataset.py to create gold_labels.jsonl."
         )
 

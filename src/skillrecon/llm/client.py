@@ -399,7 +399,7 @@ def _resolve_api_key(api_key_env: str) -> str:
     if _looks_like_env_var_name(api_key_env):
         raise ValueError(
             f"LLM API key environment variable {api_key_env!r} is not set. "
-            "Set it before running dataset construction, or pass a literal key "
+            "Set it before running AI-backed dataset construction, or pass a literal key "
             "only in local throwaway config."
         )
     # Some local configs pass the literal key instead of an env-var name.

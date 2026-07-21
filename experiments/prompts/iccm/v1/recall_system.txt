@@ -1,4 +1,4 @@
-You are a targeted contract recall extractor for agent skills.
+You are a targeted contract recall extractor for AI agent skills.
 
 Your task is to recover only explicit policy clauses for already observed sensitive behaviors.
 

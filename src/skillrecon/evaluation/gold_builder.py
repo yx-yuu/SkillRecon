@@ -1,4 +1,4 @@
-Gold-label construction for paper evaluation datasets."""
+"""AI-only gold-label construction for paper evaluation datasets."""
 
 from __future__ import annotations
 
@@ -28,7 +28,7 @@ from skillrecon.evaluation.datasets import (
 from skillrecon.loader.path_resolver import iter_skill_path_candidates
 from skillrecon.llm.cache import CachedLLMClient
 
-PROMPT_VERSION = "paper500_gold_v2"
+PROMPT_VERSION = "paper500_ai_gold_v2"
 _SHORT_TEXT = StringConstraints(max_length=300)
 _MEDIUM_TEXT = StringConstraints(max_length=600)
 ShortText = Annotated[str, _SHORT_TEXT]
@@ -74,7 +74,7 @@ _SKIP_DIRS = {
 
 
 class GoldBuildConfig(BaseModel):
-    """Prompt and source-pack limits for gold-label generation."""
+    """Prompt and source-pack limits for AI gold-label generation."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -86,7 +86,7 @@ class GoldBuildConfig(BaseModel):
 
 
 class SourceExcerpt(BaseModel):
-    """One source excerpt passed to the builder."""
+    """One source excerpt passed to the AI builder."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -107,11 +107,11 @@ class SourceBundle(BaseModel):
 
 
 class SourceCollectionError(RuntimeError):
-    """Raised when gold label construction cannot access required skill source."""
+    """Raised when AI gold construction cannot access required skill source."""
 
 
 class PolicyMapping(BaseModel):
-    """LLM-produced mapping from source/policy text to candidate behavior."""
+    """AI-produced mapping from source/policy text to candidate behavior."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -146,7 +146,7 @@ class PolicyMapping(BaseModel):
 
 
 class DependenceJudgment(BaseModel):
-    """LLM-produced judgment about workflow/payload dependence."""
+    """AI-produced judgment about workflow/payload dependence."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -157,7 +157,7 @@ class DependenceJudgment(BaseModel):
 
 
 class AuthorizationJudgment(BaseModel):
-    """LLM-produced judgment about whether a behavior is authorized."""
+    """AI-produced judgment about whether a behavior is authorized."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -167,8 +167,8 @@ class AuthorizationJudgment(BaseModel):
     rationale: MediumText
 
 
-class GoldLabelDecision(BaseModel):
-    """Structured output for one generated gold label."""
+class AIGoldLabelDecision(BaseModel):
+    """Structured AI output for one generated gold label."""
 
     model_config = ConfigDict(frozen=True)
 
@@ -212,13 +212,13 @@ class GoldLabelDecision(BaseModel):
         ]
 
     @model_validator(mode="after")
-    def _validate_gold_subtype(self) -> "GoldLabelDecision":
+    def _validate_gold_subtype(self) -> "AIGoldLabelDecision":
         if self.gold.label == "violation" and not self.gold.violation_subtype:
             raise ValueError("violation gold labels must include violation_subtype")
         return self
 
 
-def build_gold_label_records(
+def build_ai_gold_label_records(
     records: Sequence[FlaggedSkillRecord],
     *,
     dataset_root: Path,
@@ -227,7 +227,7 @@ def build_gold_label_records(
     existing_records: Sequence[GoldLabelRecord] | None = None,
     windows_drive_map: Mapping[str, str | os.PathLike[str]] | None = None,
 ) -> list[GoldLabelRecord]:
-    """Generate complete gold-label records with an LLM builder."""
+    """Generate complete gold-label records with an AI builder."""
     config = build_config or GoldBuildConfig()
     existing_by_skill = {
         record.skill_id: record
@@ -254,7 +254,7 @@ def build_gold_label_records(
         ]
         decision = client.structured_complete(
             messages,
-            GoldLabelDecision,
+            AIGoldLabelDecision,
             skill_id=record.skill_id,
             call_key=f"{config.prompt_version}_{source_bundle.source_hash}",
             max_tokens=config.max_tokens,
@@ -332,7 +332,7 @@ def _to_gold_label_record(
     *,
     record: FlaggedSkillRecord,
     source_bundle: SourceBundle,
-    decision: GoldLabelDecision,
+    decision: AIGoldLabelDecision,
     client: CachedLLMClient,
     build_config: GoldBuildConfig,
 ) -> GoldLabelRecord:
@@ -528,10 +528,10 @@ def _build_prompt(record: FlaggedSkillRecord, source_bundle: SourceBundle) -> st
     )
 
 
-_SYSTEM_PROMPT = """You construct the gold-label dataset for a paper evaluation of agent skills.
+_SYSTEM_PROMPT = """You construct the gold-label dataset for a paper evaluation of AI-agent skills.
 
 Hard constraints:
-- The dataset construction step is fully automatically generated. Do not ask for human input.
+- The dataset construction step is fully AI/script generated. Do not ask for human input.
 - The final action label must be represented only as the gold label.
 - Do not create any additional label-like fields or alternate labeling channels.
 - Human inspection, if any, happens offline after this dataset is frozen and edits the gold field directly.

@@ -1,0 +1,6 @@
+# Development dependencies for SkillRecon
+# Install with: pip install -r requirements-dev.txt
+# Or preferably: pip install -e ".[dev]"
+
+-r requirements.txt
+pytest>=8,<10

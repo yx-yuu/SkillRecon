@@ -104,7 +104,7 @@ def main() -> None:
                 bucket=flagged.dataset_bucket if flagged is not None else "extended_rq2",
                 metadata=sanitize_gold_metadata(
                     {
-                        "assessment": "extended_rq2_gold",
+                        "assessment": "ai_generated_extended_rq2_gold",
                         "scan_summary": item.notes,
                     }
                 ),

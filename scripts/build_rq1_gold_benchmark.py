@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an RQ1 gold-label benchmark from explicit items."""
+"""Build an AI-generated RQ1 gold-label benchmark from explicit items."""
 
 from __future__ import annotations
 
@@ -65,7 +65,7 @@ class _BenchmarkItem(BaseModel):
     artifact_dir: str
 
 
-_SYSTEM_PROMPT = """You are an exacting evaluator for documentation-derived authorization semantics in agent skills.
+_SYSTEM_PROMPT = """You are an exacting evaluator for documentation-derived authorization semantics in AI agent skills.
 
 Task 1: For each provided predicted clause, judge its gold operator as exactly one of:
 - allowed
@@ -86,7 +86,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Build an RQ1 gold-label benchmark"
+        description="Build an AI-generated RQ1 gold-label benchmark"
     )
     parser.add_argument(
         "--items-json",
@@ -111,7 +111,7 @@ def main() -> None:
     parser.add_argument(
         "--llm-config",
         default=str(DEFAULT_LLM_CONFIG_PATH),
-        help="Path to llm_config.json for the RQ1 gold builder",
+        help="Path to llm_config.json for the AI RQ1 gold builder",
     )
     parser.add_argument("--base-url", help="LLM API base URL override")
     parser.add_argument("--model", help="LLM model name override")
@@ -207,7 +207,7 @@ def main() -> None:
                 edge_labels=edge_labels,
                 metadata=sanitize_gold_metadata(
                     {
-                        "assessment": "rq1_gold_benchmark",
+                        "assessment": "ai_generated_rq1_gold_benchmark",
                     }
                 ),
             )

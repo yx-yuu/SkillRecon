@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Prepare a small gold-label pilot package."""
+"""Prepare a small AI-generated gold-label pilot package."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from skillrecon.evaluation.datasets import (
 from skillrecon.evaluation.gold_builder import (
     GoldBuildConfig,
     SourceCollectionError,
-    build_gold_label_records,
+    build_ai_gold_label_records,
 )
 from skillrecon.loader.path_resolver import parse_windows_drive_map
 from skillrecon.llm.cache import CachedLLMClient
@@ -32,7 +32,7 @@ from skillrecon.llm.cache import CachedLLMClient
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Build a pilot evaluation package with gold labels"
+        description="Build a pilot evaluation package with AI-generated gold labels"
     )
     parser.add_argument(
         "--index-path",
@@ -79,7 +79,7 @@ def main() -> None:
     parser.add_argument(
         "--llm-config",
         default=str(DEFAULT_LLM_CONFIG_PATH),
-        help="Path to llm_config.json for the gold-label generator",
+        help="Path to llm_config.json for the AI gold-label generator",
     )
     parser.add_argument(
         "--drive-map",
@@ -133,19 +133,19 @@ def main() -> None:
         )
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
-    client = CachedLLMClient.from_config(llm_config, "pilot_gold_v1")
+    client = CachedLLMClient.from_config(llm_config, "pilot_ai_gold_v1")
     existing_gold_labels = (
         load_gold_label_records(gold_label_path)
         if args.resume and gold_label_path.is_file()
         else []
     )
     try:
-        gold_labels = build_gold_label_records(
+        gold_labels = build_ai_gold_label_records(
             sample,
             dataset_root=dataset_root,
             client=client,
             build_config=GoldBuildConfig(
-                prompt_version="pilot_gold_v1",
+                prompt_version="pilot_ai_gold_v1",
                 max_tokens=args.max_tokens,
             ),
             existing_records=existing_gold_labels,

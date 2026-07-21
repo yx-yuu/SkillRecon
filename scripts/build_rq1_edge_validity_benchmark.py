@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build an RQ1 edge-validity gold-label benchmark."""
+"""Build an AI-generated RQ1 edge-validity gold-label benchmark."""
 
 from __future__ import annotations
 
@@ -94,7 +94,7 @@ class _SampledEdgeItem(BaseModel):
     candidate_sources: list[str] = []
 
 
-_SYSTEM_PROMPT = """You are an exacting evaluator for cross-modal reconciliation relations in agent skills.
+_SYSTEM_PROMPT = """You are an exacting evaluator for cross-modal reconciliation relations in AI agent skills.
 
 Task: For each candidate relation item, judge whether the stated relation should hold.
 
@@ -118,7 +118,7 @@ def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="Build an RQ1 edge-validity gold-label benchmark"
+        description="Build an AI-generated RQ1 edge-validity gold-label benchmark"
     )
     parser.add_argument(
         "--base-gold-labels",
@@ -143,7 +143,7 @@ def main() -> None:
     parser.add_argument(
         "--llm-config",
         default=str(DEFAULT_LLM_CONFIG_PATH),
-        help="Path to llm_config.json for the edge-validity gold builder",
+        help="Path to llm_config.json for the AI edge-validity gold builder",
     )
     parser.add_argument("--base-url", help="LLM API base URL override")
     parser.add_argument("--model", help="LLM model name override")

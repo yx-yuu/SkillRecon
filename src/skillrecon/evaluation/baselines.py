@@ -28,7 +28,7 @@ class _LLMJudgeDecision(BaseModel):
     rationale: str
 
 
-_LLM_JUDGE_SYSTEM_PROMPT = """You are a documentation-code consistency judge for agent skills.
+_LLM_JUDGE_SYSTEM_PROMPT = """You are a documentation-code consistency judge for AI agent skills.
 Classify the skill as exactly one of:
 - violation
 - exposure-only

@@ -19,7 +19,7 @@ from skillrecon.evaluation.datasets import (
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Inspect gold-label datasets. Dataset construction writes "
+            "Inspect AI-generated gold-label datasets. Dataset construction writes "
             "gold_labels.jsonl directly; this CLI does not create labels from a "
             "separate sheet."
         )
