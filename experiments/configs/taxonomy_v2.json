@@ -1,0 +1,109 @@
+{
+  "version": "v2",
+  "description": "SkillRecon capability taxonomy v2. Semantic vocabulary only — detection rules live in CodeQL queries and bash_patterns.json, not here.",
+  "design_notes": {
+    "v1_to_v2_change": "Removed detection_rules section (python_patterns, js_patterns, bash_patterns). Detection is now handled by CodeQL Concepts (Tier 1), API-Graph queries (Tier 2), and experiments/configs/bash_patterns.json (Tier 3). The taxonomy defines WHAT to detect, not HOW.",
+    "atom_additions": ["sql_exec", "deserialization"],
+    "atom_removals": []
+  },
+  "categories": {
+    "network": {
+      "description": "Network communication capabilities",
+      "atoms": [
+        "http_request",
+        "dns_lookup",
+        "socket_connect",
+        "websocket",
+        "ftp_transfer",
+        "smtp_send",
+        "ssh_connect"
+      ]
+    },
+    "filesystem": {
+      "description": "File system access capabilities",
+      "atoms": [
+        "file_read",
+        "file_write",
+        "file_delete",
+        "file_execute",
+        "directory_list",
+        "directory_create",
+        "file_permission_change",
+        "temp_file_create"
+      ]
+    },
+    "process": {
+      "description": "Process and code execution capabilities",
+      "atoms": [
+        "shell_exec",
+        "subprocess_spawn",
+        "eval_exec",
+        "dynamic_import",
+        "signal_send",
+        "process_kill"
+      ]
+    },
+    "credential": {
+      "description": "Credential and secret access capabilities",
+      "atoms": [
+        "env_var_read",
+        "token_file_read",
+        "api_key_use",
+        "credential_store_access",
+        "keychain_access"
+      ]
+    },
+    "data_exfil": {
+      "description": "Data exfiltration and encoding capabilities",
+      "atoms": [
+        "data_upload",
+        "data_encode_send",
+        "clipboard_access",
+        "screenshot_capture"
+      ]
+    },
+    "data_processing": {
+      "description": "Data processing capabilities with security implications",
+      "atoms": [
+        "sql_exec",
+        "deserialization"
+      ]
+    },
+    "system": {
+      "description": "System-level access capabilities",
+      "atoms": [
+        "registry_access",
+        "service_management",
+        "cron_schedule",
+        "kernel_module"
+      ]
+    }
+  },
+  "a_req": [
+    "http_request",
+    "dns_lookup",
+    "socket_connect",
+    "websocket",
+    "ftp_transfer",
+    "smtp_send",
+    "env_var_read",
+    "token_file_read",
+    "api_key_use",
+    "shell_exec",
+    "subprocess_spawn",
+    "eval_exec",
+    "dynamic_import",
+    "file_delete",
+    "file_execute",
+    "file_permission_change",
+    "data_upload",
+    "data_encode_send",
+    "credential_store_access",
+    "keychain_access",
+    "process_kill",
+    "ssh_connect",
+    "cron_schedule",
+    "sql_exec",
+    "deserialization"
+  ]
+}

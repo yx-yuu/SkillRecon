@@ -1,0 +1,35 @@
+Analyze the following documentation steps from skill "{skill_id}" and extract all contract clauses.
+
+## Capability Taxonomy
+The following capability atoms are valid values for the "capability" field:
+{taxonomy_atoms}
+
+## Documentation Steps
+{doc_blocks}
+
+## Output Requirements
+Return a JSON object with a "clauses" array. Each clause must have:
+- step_id: identifier for the documentation step this clause comes from
+- capability: one of the taxonomy atoms listed above
+- operator: "allowed" | "prohibited" | "unknown"
+- target: the specific target of the capability (URL, path, command, etc.), or null
+- constraint: any scope or condition limiting this capability, or null
+- evidence_span: direct quote from the document supporting this clause
+- confidence_note: brief note on extraction confidence
+
+Extract ALL clauses you can find. Include both explicit declarations (like allowed-tools) and implicit capability references.
+
+Important extraction guidance:
+- A clause may be "allowed" even when the text uses operational requirement language instead of the words "allow" or "permit".
+- Examples of operational authorization that should usually be extracted as "allowed":
+  - "all requests require x-api-key header"
+  - "set OURA_ACCESS_TOKEN before running"
+  - "POST https://api.example.com/v1/..."
+  - "run python scripts/main.py"
+  - API parameter / endpoint tables that define the concrete request shape used by the skill
+- Keep the target concrete when possible:
+  - domain / URL / endpoint path for http_request
+  - env var name for env_var_read or api_key_use
+  - command / script name for shell_exec
+  - request field or endpoint-specific limitation as constraint
+- If the text is only a generic feature description with no concrete operational target or requirement, prefer "unknown".

@@ -1,0 +1,93 @@
+{
+  "version": "v1",
+  "description": "Bash command patterns for Tier 3 conservative extraction. Bash commands are stable identifiers (curl is always curl), so pattern matching is appropriate here unlike Python/JS APIs.",
+  "patterns": {
+    "http_request": {
+      "commands": ["curl", "wget", "httpie", "http"],
+      "notes": "HTTP client commands"
+    },
+    "ssh_connect": {
+      "commands": ["ssh", "scp", "sftp", "rsync"],
+      "notes": "Remote shell and file transfer"
+    },
+    "file_delete": {
+      "commands": ["rm", "rmdir", "shred"],
+      "notes": "File/directory removal"
+    },
+    "file_permission_change": {
+      "commands": ["chmod", "chown", "chgrp"],
+      "notes": "Permission and ownership changes"
+    },
+    "shell_exec": {
+      "commands": [
+        "bash",
+        "sh",
+        "zsh",
+        "eval",
+        "source",
+        ".",
+        "python",
+        "python3",
+        "node",
+        "nodejs",
+        "deno",
+        "ruby",
+        "uv run",
+        "poetry run",
+        "npx"
+      ],
+      "notes": "Shell invocation and script sourcing"
+    },
+    "subprocess_spawn": {
+      "commands": ["nohup", "screen", "tmux", "xargs"],
+      "notes": "Background/detached process spawning"
+    },
+    "env_var_read": {
+      "patterns": ["\\$\\{?[A-Z_][A-Z0-9_]*\\}?", "export\\s+", "printenv"],
+      "notes": "Environment variable references and exports"
+    },
+    "cron_schedule": {
+      "commands": ["crontab", "at", "batch"],
+      "notes": "Task scheduling"
+    },
+    "file_write": {
+      "patterns": [">\\s+", ">>\\s+", "tee\\s+"],
+      "notes": "Output redirection and tee"
+    },
+    "data_encode_send": {
+      "commands": ["base64", "xxd", "openssl enc"],
+      "notes": "Data encoding commands"
+    },
+    "dns_lookup": {
+      "commands": ["dig", "nslookup", "host"],
+      "notes": "DNS query commands"
+    },
+    "process_kill": {
+      "commands": ["kill", "killall", "pkill"],
+      "notes": "Process termination"
+    },
+    "dynamic_import": {
+      "commands": [
+        "pip install",
+        "pip3 install",
+        "python -m pip install",
+        "python3 -m pip install",
+        "npm install",
+        "npm ci",
+        "yarn add",
+        "pnpm add",
+        "pnpm install",
+        "uv pip install",
+        "uv add",
+        "uv sync",
+        "poetry add",
+        "poetry install"
+      ],
+      "notes": "Package installation (runtime dependency injection)"
+    },
+    "service_management": {
+      "commands": ["systemctl", "service", "launchctl"],
+      "notes": "System service management"
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "scope_note": "No public system found so far has the same target as SkillRecon's clause-scope documentation-to-code reconciliation with cross-file witnesses. These baselines are the closest public paper/system methods with runnable code.",
+  "merge_command": "PYTHONPATH=src python3 scripts/merge_baseline_predictions.py --input derived/external_baselines/baseline_predictions/baseline_skillfortify.jsonl --input derived/external_baselines/baseline_predictions/baseline_cisco_skill_scanner.jsonl --input derived/external_baselines/baseline_predictions/baseline_skillspector.jsonl --output derived/external_baselines/baseline_predictions/paper_method_baselines.jsonl",
+  "baselines": [
+    {
+      "system_id": "baseline_skillfortify",
+      "name": "SkillFortify",
+      "repo_url": "https://github.com/qualixar/skillfortify",
+      "source_status": "open_source",
+      "adapter_strategy": "external_cli_migration",
+      "method_reference": "Formal Analysis and Supply Chain Security for Agentic AI Skills (arXiv:2603.00195)",
+      "install": "pip install skillfortify",
+      "single_case_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_skillfortify --skill-id youtube-summary --skill-path data/skill_dataset/youtube-summary --output-dir derived/external_baselines_smoke",
+      "full_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_skillfortify --paper-dataset data/evaluation/skill_paper500_dataset --data-root data/skill_dataset --drive-map E=/mnt/e --output-dir derived/external_baselines",
+      "fit_to_skillrecon": "Closest formal capability/supply-chain baseline, but it does not model SkillRecon's clause-level scope reconciliation or replayable witnesses."
+    },
+    {
+      "system_id": "baseline_cisco_skill_scanner",
+      "name": "Cisco Skill Scanner",
+      "repo_url": "https://github.com/cisco-ai-defense/skill-scanner",
+      "source_status": "open_source",
+      "adapter_strategy": "external_cli_migration",
+      "method_reference": "AI Agent Skill security scanner with static, behavioral, and optional LLM analyzers",
+      "install": "pip install cisco-ai-skill-scanner",
+      "single_case_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_cisco_skill_scanner --skill-id youtube-summary --skill-path data/skill_dataset/youtube-summary --output-dir derived/external_baselines_smoke",
+      "full_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_cisco_skill_scanner --paper-dataset data/evaluation/skill_paper500_dataset --data-root data/skill_dataset --drive-map E=/mnt/e --output-dir derived/external_baselines",
+      "fit_to_skillrecon": "Strong security-scanner baseline for prompt injection, exfiltration, malicious code, and behavioral dataflow; not a dedicated documentation authorization checker."
+    },
+    {
+      "system_id": "baseline_skillspector",
+      "name": "SkillSpector",
+      "repo_url": "https://github.com/NVIDIA/SkillSpector",
+      "source_status": "open_source",
+      "adapter_strategy": "external_cli_migration",
+      "method_reference": "Agent Skills in the Wild scanner implementation and vulnerability taxonomy",
+      "install": "Clone and install SkillSpector with Python 3.12+, or use its Docker image.",
+      "single_case_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_skillspector --skill-id youtube-summary --skill-path data/skill_dataset/youtube-summary --output-dir derived/external_baselines_smoke",
+      "full_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_skillspector --paper-dataset data/evaluation/skill_paper500_dataset --data-root data/skill_dataset --drive-map E=/mnt/e --output-dir derived/external_baselines",
+      "fit_to_skillrecon": "Relevant static vulnerability and agent-skill taxonomy baseline; Python 3.12+ can make it optional in older environments."
+    },
+    {
+      "system_id": "baseline_snyk_agent_scan",
+      "name": "Snyk Agent Scan",
+      "repo_url": "https://github.com/snyk/agent-scan",
+      "source_status": "open_source_with_credentialed_service",
+      "adapter_strategy": "optional_external_cli_migration",
+      "method_reference": "Snyk AI agent, MCP, and skill security scanner",
+      "install": "uvx snyk-agent-scan@latest scan --json --skills <skill-path>; requires SNYK_TOKEN for normal operation.",
+      "single_case_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_snyk_agent_scan --skill-id youtube-summary --skill-path data/skill_dataset/youtube-summary --output-dir derived/external_baselines_smoke",
+      "full_command": "PYTHONPATH=src python3 scripts/run_external_baselines.py --scanner baseline_snyk_agent_scan --paper-dataset data/evaluation/skill_paper500_dataset --data-root data/skill_dataset --drive-map E=/mnt/e --output-dir derived/external_baselines",
+      "fit_to_skillrecon": "Optional product baseline because credentialed cloud access is not suitable as a mandatory artifact smoke dependency."
+    }
+  ]
+}

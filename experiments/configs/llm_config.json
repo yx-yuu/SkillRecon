@@ -1,0 +1,8 @@
+{
+  "base_url": "https://open.bigmodel.cn/api/coding/paas/v4",
+  "model": "glm-5.1",
+  "api_key_env": "SKILLRECON_API_KEY",
+  "temperature": 0.0,
+  "max_tokens": 8192,
+  "structured_output_mode": "json_prompt"
+}

@@ -1,0 +1,38 @@
+{
+  "paper_dataset": "data/evaluation/skill_paper500_dataset",
+  "sample_size": 1500,
+  "slice_counts": {
+    "high": 500,
+    "medium": 500,
+    "low": 500
+  },
+  "gold_label_count": 1500,
+  "gold_label_counts": {
+    "violation": 432,
+    "exposure-only": 719,
+    "benign": 349
+  },
+  "risk_tier_counts": {
+    "high_risk": 500,
+    "medium_risk": 500,
+    "no_risk": 500
+  },
+  "bucket_counts": {
+    "mixed": 227,
+    "pure_bash": 175,
+    "pure_js": 88,
+    "pure_py": 300,
+    "pure_ts": 22,
+    "skill_md_only": 688
+  },
+  "artifacts": {
+    "gold_labels": "gold_labels.jsonl",
+    "openclaw_predictions": "baseline_predictions/openclaw.jsonl",
+    "skill_list": "all_skills.txt"
+  },
+  "notes": [
+    "Dataset construction is automatically generated.",
+    "The action supervision label is stored only in each record's gold field.",
+    "Offline human calibration edits the gold field directly after dataset freeze."
+  ]
+}

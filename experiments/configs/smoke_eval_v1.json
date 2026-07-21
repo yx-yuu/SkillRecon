@@ -1,0 +1,12 @@
+{
+  "default_suite": "paper_alignment",
+  "suites": {
+    "paper_alignment": {
+      "description": "Lightweight checks for configurable policies and paper-facing RQ/table alignment.",
+      "nodeids": [
+        "tests/test_paper_alignment.py",
+        "tests/test_submission_artifact.py"
+      ]
+    }
+  }
+}

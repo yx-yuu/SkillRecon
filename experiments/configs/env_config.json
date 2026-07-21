@@ -1,0 +1,18 @@
+{
+  "codeql": {
+    "bin": "codeql",
+    "home": "",
+    "note": "Set this to your local CodeQL installation if you want to rerun Python/JavaScript cases from source."
+  },
+  "vote_policy": {
+    "n_samples": 1,
+    "agreement_threshold": 0.6
+  },
+  "reconciliation": {
+    "max_candidates_per_behavior": 8,
+    "max_alignment_fallbacks_per_step": 3,
+    "max_semantic_event_fallbacks": 3,
+    "max_semantic_path_fallbacks": 2,
+    "overlap_policy_path": "experiments/configs/overlap_policy_v1.json"
+  }
+}

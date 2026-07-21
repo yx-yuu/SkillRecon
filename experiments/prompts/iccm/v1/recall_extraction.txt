@@ -1,0 +1,30 @@
+Analyze the following documentation steps from skill "{skill_id}".
+
+Your goal is NOT broad extraction. Recover only clauses that explicitly authorize, prohibit, or tightly constrain the already observed sensitive behaviors below.
+
+## Observed Sensitive Behaviors
+{focus_context}
+
+## Capability Taxonomy
+The following capability atoms are valid values for the "capability" field:
+{taxonomy_atoms}
+
+## Documentation Steps
+{doc_blocks}
+
+## Output Requirements
+Return a JSON object with a "clauses" array. Each clause must have:
+- step_id: identifier for the documentation step this clause comes from
+- capability: one of the taxonomy atoms listed above
+- operator: "allowed" | "prohibited" | "unknown"
+- target: the specific target of the capability (URL, path, command, service, etc.), or null
+- constraint: any scope or condition limiting this capability, or null
+- evidence_span: direct quote from the document supporting this clause
+- confidence_note: brief note explaining why this is a policy clause for one of the observed behaviors
+
+Extraction policy:
+- Extract only clauses that directly govern one of the observed sensitive behaviors, or a specific target/resource tied to that behavior.
+- Do not extract generic feature descriptions or bare command examples unless the same text explicitly says what is allowed, disallowed, required, or limited.
+- If a block only shows how to run a command or what output looks like, return no clause from that block.
+- If the text contains a scoped restriction such as "only", "must", "do not", "without", "cannot", or similar policy language, preserve that restriction in target/constraint.
+- If the block defines a concrete endpoint, host, auth header, required environment variable, or mandatory command for one of the observed behaviors, treat that as policy-bearing operational authorization rather than discarding it as a mere example.

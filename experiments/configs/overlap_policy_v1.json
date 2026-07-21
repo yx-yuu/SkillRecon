@@ -1,0 +1,22 @@
+{
+  "version": "v1",
+  "description": "Defines which capability atoms are considered comparable for reconciliation predicates. Versioned independently from taxonomy.",
+  "families": [
+    {
+      "canonical": "shell_exec",
+      "members": ["shell_exec", "subprocess_spawn"]
+    },
+    {
+      "canonical": "file_read",
+      "members": ["file_read", "token_file_read"]
+    },
+    {
+      "canonical": "http_request",
+      "members": ["http_request", "data_upload"]
+    },
+    {
+      "canonical": "file_write",
+      "members": ["file_write", "temp_file_create"]
+    }
+  ]
+}
