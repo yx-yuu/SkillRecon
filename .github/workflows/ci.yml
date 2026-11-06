@@ -12,8 +12,6 @@ jobs:
   python:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
-    env:
-      PYTHONPYCACHEPREFIX: ${{ runner.temp }}/python-cache
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
@@ -27,6 +25,8 @@ jobs:
       - name: Check dependencies
         run: python -m pip check
       - name: Check Python sources
+        env:
+          PYTHONPYCACHEPREFIX: ${{ runner.temp }}/python-cache
         run: python -m compileall -q src scripts
       - name: Check command-line entry points
         run: |
