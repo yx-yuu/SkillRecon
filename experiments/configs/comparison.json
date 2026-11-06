@@ -1,0 +1,64 @@
+{
+  "gold": "../../annotations/main.jsonl",
+  "main_system": "skillrecon",
+  "systems": {
+    "skillrecon": {
+      "artifacts": "../../outputs/skillrecon",
+      "native_types": true
+    },
+    "baseline_rule_scanner": {
+      "predictions": "../../outputs/internal/predictions.jsonl",
+      "system_id": "baseline_rule_scanner",
+      "native_types": true
+    },
+    "baseline_llm_judge": {
+      "predictions": "../../outputs/internal/predictions.jsonl",
+      "system_id": "baseline_llm_judge",
+      "native_types": true
+    },
+    "baseline_capability_lattice": {
+      "predictions": "../../outputs/internal/predictions.jsonl",
+      "system_id": "baseline_capability_lattice",
+      "native_types": true
+    },
+    "baseline_doc_code_consistency": {
+      "predictions": "../../outputs/internal/predictions.jsonl",
+      "system_id": "baseline_doc_code_consistency",
+      "native_types": true
+    },
+    "baseline_spec_containment": {
+      "predictions": "../../outputs/internal/predictions.jsonl",
+      "system_id": "baseline_spec_containment",
+      "native_types": true
+    },
+    "baseline_instruction_constraints": {
+      "predictions": "../../outputs/internal/predictions.jsonl",
+      "system_id": "baseline_instruction_constraints",
+      "native_types": true
+    },
+    "baseline_openclaw": {
+      "predictions": "../../outputs/openclaw/baseline_predictions/baseline_openclaw.jsonl",
+      "native_types": false
+    },
+    "baseline_skillfortify": {
+      "predictions": "../../outputs/skillfortify/baseline_predictions/baseline_skillfortify.jsonl",
+      "native_types": false
+    },
+    "baseline_cisco_skill_scanner": {
+      "predictions": "../../outputs/cisco_skill_scanner/baseline_predictions/baseline_cisco_skill_scanner.jsonl",
+      "native_types": false
+    },
+    "baseline_skillspector": {
+      "predictions": "../../outputs/skillspector/baseline_predictions/baseline_skillspector.jsonl",
+      "native_types": false
+    },
+    "baseline_snyk_agent_scan": {
+      "predictions": "../../outputs/snyk_agent_scan/baseline_predictions/baseline_snyk_agent_scan.jsonl",
+      "native_types": false
+    },
+    "baseline_malskills_full": {
+      "predictions": "../../outputs/malskills_full/baseline_predictions/baseline_malskills_full.jsonl",
+      "native_types": false
+    }
+  }
+}

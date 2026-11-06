@@ -1,257 +1,282 @@
-# SkillRecon
+<p align="center">
+  <img src="assets/skillrecon-icon.png" width="112" height="112" align="middle" alt="SkillRecon icon">
+  &nbsp;
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/skillrecon-wordmark-dark.svg">
+    <source media="(prefers-color-scheme: light)" srcset="assets/skillrecon-wordmark-light.svg">
+    <img src="assets/skillrecon-wordmark-light.svg" width="340" align="middle" alt="SkillRecon">
+  </picture>
+</p>
 
-> **SkillRecon: Witnessing Intent-Behavior Inconsistency in Agent Skills via Contract Graph Reconciliation**
+<p align="center">
+  <strong>Witnessing Intent–Behavior Inconsistency in Agent Skills</strong>
+</p>
 
-SkillRecon verifies whether an agent skill's implementation faithfully realizes its documented
-intent. Given a skill package — documentation, configuration, source files, scripts, and inline
-code blocks — SkillRecon constructs a **contract graph** ($G_D$) from the documentation side,
-a **behavior graph** ($G_C$) from the implementation side, and a proof-carrying
-**reconciliation graph** ($G_X$) that records whether each observed behavior is authorized,
-contradicted, or unresolved by the documented contract. The output includes structured findings,
-exposures, diagnostics, and **minimal violation witness subgraphs** — inspectable evidence that
-pinpoints exactly where intent and behavior diverge.
+<p align="center">
+  <a href=".github/workflows/ci.yml"><img src="https://img.shields.io/badge/CI-GitHub_Actions-2088FF?style=flat-square&amp;logo=githubactions&amp;logoColor=white" alt="CI: GitHub Actions"></a>
+  <a href="#setup"><img src="https://img.shields.io/badge/Python-3.12%2B-3776AB?style=flat-square&amp;logo=python&amp;logoColor=white" alt="Python 3.12+"></a>
+  <a href="https://github.com/github/codeql-cli-binaries/releases/tag/v2.27.3"><img src="https://img.shields.io/badge/CodeQL-2.27.3-24292F?style=flat-square&amp;logo=github&amp;logoColor=white" alt="CodeQL 2.27.3"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-2E7D32?style=flat-square" alt="MIT License"></a>
+</p>
+
+<p align="center">
+  <a href="#overview">Overview</a> &nbsp;·&nbsp;
+  <a href="#architecture">Architecture</a> &nbsp;·&nbsp;
+  <a href="#setup">Setup &amp; Usage</a> &nbsp;·&nbsp;
+  <a href="#data">Data &amp; Hyperparameters</a> &nbsp;·&nbsp;
+  <a href="schemas/README.md">Input Formats</a>
+</p>
+
+---
 
 ## Overview
 
-Agent skills present a unique verification challenge: a skill's documentation describes what
-it *should* do, but the implementation may silently exceed those boundaries. Existing
-approaches either scan for known malicious patterns or check coarse-grained capability
-containment — neither answers whether a specific documented clause actually authorizes a
-specific observed behavior.
+SkillRecon checks whether an agent skill's implementation conforms to its documented authorization. It extracts capability and scope contracts from documentation, recovers behavior across code artifacts, reconciles the two, and produces verifiable inconsistency witnesses.
 
-SkillRecon addresses this through **cross-modal graph reconciliation**:
+| Intent Extraction | Behavior Recovery | Reconciliation | Verifiable Witnesses |
+|:---:|:---:|:---:|:---:|
+| Ground documented capabilities and scope constraints. | Recover behavior and verified flows across artifacts. | Check capability, scope, and path authorization. | Export evidence for independent revalidation. |
 
-1. **Contract Extraction** — An LLM-based extractor (ICCM) induces structured authorization
-   clauses from SKILL.md and supporting documents, producing the Intent Contract Graph $G_D$.
-2. **Behavior Extraction** — A tiered static analyzer lifts code-level capabilities across
-   Python, JavaScript/TypeScript, and Bash into the Behavior Dependence Graph $G_C$.
-3. **Reconciliation** — Six three-valued predicates evaluate candidate clause-to-behavior
-   links, yielding the Reconciliation Graph $G_X$ where every cross-modal edge carries a
-   verifiable truth status.
-4. **Witness Generation** — Bounded search over $G_X$ produces **minimal violation witness
-   subgraphs** — compact, self-contained evidence that traces a specific documentation clause
-   to the code behavior that violates it.
+The artifact provides the four-stage method, twelve comparison methods, ablations, documentation perturbations, hyperparameter experiments, and evaluation for RQ1–RQ4 and cross-platform generalization. Supported inputs include OpenClaw skills, Claude Code packages, and opencode packages.
 
-The result is not a suspicious/benign verdict, but an inspectable, replayable evidence
-bundle: what was promised, what was done, and exactly where the two diverge.
-
-## Pipeline
+## Architecture
 
 ```mermaid
-flowchart TB
-    SKILL["Skill Package<br/>S = (D, C)"] --> DOC["Documentation D<br/>SKILL.md + configs"]
-    SKILL --> CODE["Code C<br/>Python / JS / TS / Bash + scripts"]
+flowchart TD
+    A[Dataset catalogs / skill packages] --> B[Package loading · loader]
+    B --> C[Documentation and permissions]
+    B --> D[Code and executable instructions]
+    M[LLM configuration and prompts] --> E[Intent extraction · contract]
+    C --> E
+    Q[CodeQL and native analyzers] --> F[Behavior recovery · behavior]
+    D --> F
+    F --> R[Targeted intent recall]
+    M --> R
+    C --> R
+    E --> R
+    R --> G[Reconciliation · reconcile]
+    F --> G
+    G --> H[Inconsistency witnesses · detect]
+    H --> I[Independent witness validation]
+    E --> J[Internal comparison methods]
+    F --> J
+    A --> K[External baseline scanners]
+    H --> L[Evaluation · evaluation]
+    I --> L
+    J --> L
+    K --> L
+    N[Annotations and experiment configuration] --> L
+    L --> O[RQ1–RQ4 and cross-platform metrics]
 
-    subgraph STAGE1["Stage 1 — Contract Extraction"]
-        DOC --> DET["Deterministic pass<br/>structured field parsing"]
-        DET --> ICCM["ICCM extraction<br/>LLM sampling + voting + auth guard"]
-        ICCM --> GD["Intent Contract Graph<br/>G<sub>D</sub>"]
-    end
-
-    subgraph STAGE2["Stage 2 — Behavior Extraction"]
-        CODE --> CODEQL["CodeQL concepts<br/>cross-language QL queries"]
-        CODE --> APIG["API-Graph gap-fill<br/>call-graph + import analysis"]
-        CODE --> BASH["Bash patterns<br/>regex-based command matching"]
-        CODEQL --> NORM["Capability normalization<br/>taxonomy 𝒜 + scope Σ"]
-        APIG --> NORM
-        BASH --> NORM
-        NORM --> GC["Behavior Dependence Graph<br/>G<sub>C</sub>"]
-    end
-
-    GD --> RECON
-    GC --> RECON
-
-    subgraph STAGE3["Stage 3 — Reconciliation"]
-        RECON["Candidate linking<br/>clause ↔ capability event"] --> PRED["6 three-valued predicates"]
-        PRED --> RULES["3 derivation rules"]
-        RULES --> GX["Reconciliation Graph<br/>G<sub>X</sub> = G<sub>D</sub> ∪ G<sub>C</sub> ∪ ℛ"]
-        GX --> RECALL["Targeted recall<br/>authorization clause back-fill"]
-        RECALL --> GD
-    end
-
-    GX --> STAGE4
-
-    subgraph STAGE4["Stage 4 — Detection &amp; Witness"]
-        CERT["Certificate generation"] --> SEARCH["Bounded witness search"]
-        SEARCH --> WV["Minimal Violation Witness Subgraphs<br/>{W<sub>v</sub>}"]
-        SEARCH --> AUDIT["Audit report<br/>findings / exposures / diagnostics"]
-    end
-
-    WV --> OUT
-    AUDIT --> OUT
-
-    OUT["Review Report + Evidence Bundle"]
-
-    style SKILL fill:#f9fafb,stroke:#6b7280
-    style STAGE1 fill:#dbeafe,stroke:#3b82f6
-    style STAGE2 fill:#dcfce7,stroke:#22c55e
-    style STAGE3 fill:#fef9c3,stroke:#eab308
-    style STAGE4 fill:#f3f4f6,stroke:#6b7280
-    style OUT fill:#e0e7ff,stroke:#4f46e5
+    classDef intent fill:#eef2ff,stroke:#818cf8,color:#312e81
+    classDef behavior fill:#f0fdfa,stroke:#2dd4bf,color:#134e4a
+    classDef evidence fill:#f8fafc,stroke:#94a3b8,color:#0f172a
+    class C,E,R intent
+    class D,F,Q behavior
+    class G,H,I,O evidence
 ```
 
-## Repository Layout
+<a id="setup"></a>
+
+## Setup & Usage
+
+Use Linux with Python 3.12 or 3.13 and [CodeQL CLI 2.27.3](https://github.com/github/codeql-cli-binaries/releases/tag/v2.27.3).
+
+### Installation
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -e .
+
+# Add the CodeQL executable to PATH, then install query dependencies.
+codeql pack install experiments/codeql/queries/python
+codeql pack install experiments/codeql/queries/javascript
+```
+
+### Model configuration
+
+Copy the model configuration and set the service endpoint and model name. GLM, DeepSeek, and Qwen3.8 use the same Chat Completions interface.
+
+```bash
+cp experiments/configs/llm_config.json experiments/configs/llm.local.json
+export SKILLRECON_API_KEY='YOUR_API_KEY'
+```
+
+Set `base_url` and `model` in `experiments/configs/llm.local.json` to your chosen service and model.
+
+### Prepare data and run analysis
+
+Dataset catalogs contain package identities and source versions. Prepare the selected packages into `data/packages/`:
+
+```bash
+skillrecon prepare --catalog datasets/main/catalog.jsonl \
+  --output data/packages --limit 3
+
+# For a local collection, add --source-root /path/to/extracted-packages.
+# Omit --limit to prepare the complete collection.
+skillrecon batch --skills-file datasets/main/skills.txt \
+  --data-root data/packages --output-dir outputs/skillrecon \
+  --llm-config experiments/configs/llm.local.json --limit 3
+```
+
+#### Analyze a single package
+
+Use the package path relative to the data root:
+
+```bash
+skillrecon analyze --skill owner/skill --data-root data/packages \
+  --output-dir outputs/skillrecon \
+  --llm-config experiments/configs/llm.local.json
+
+skillrecon replay outputs/skillrecon/owner/skill/witness_bundles/witness-0001.json
+```
+
+### Baselines
+
+The six internal methods are Rule-based scanner, LLM-as-judge, Capability-lattice, Doc-code consistency, Spec containment, and Instruction constraints.
+
+```bash
+skillrecon internal-baselines --gold annotations/main.jsonl \
+  --artifacts outputs/skillrecon --output outputs/internal \
+  --llm-judge --llm-config experiments/configs/llm.local.json
+```
+
+Install the external scanners in their respective environments. Their public repositories and command identifiers are listed in [the baseline configuration](experiments/configs/baselines.json).
+
+<details>
+<summary><strong>External scanners and native scan imports</strong></summary>
+
+```bash
+skillrecon baselines --scanner baseline_cisco_skill_scanner \
+  --skills-file datasets/main/skills.txt --data-root data/packages \
+  --output-dir outputs/cisco_skill_scanner --limit 3
+
+# Import an OpenClaw native scan export.
+skillrecon baselines --scanner baseline_openclaw \
+  --raw-json owner/skill=/path/to/native-scan.json \
+  --output-dir outputs/openclaw
+
+# Run native MalSkills with its selected model configuration.
+skillrecon baselines --scanner baseline_malskills_full \
+  --scanner-python /path/to/malskills-env/bin/python \
+  --scanner-config experiments/configs/baselines/malskills-glm.toml \
+  --skill-id owner/skill --skill-path data/packages/owner/skill \
+  --output-dir outputs/malskills_full
+```
+
+MalSkills uses `MALSKILLS_LLM_BASE_URL` and `MALSKILLS_LLM_API_KEY`. DeepSeek and Qwen profiles are in the same configuration directory. External scanner options can be passed with `--scanner-arg`.
+
+</details>
+
+### Experiments
+
+Configure the annotation paths and system outputs in `experiments/configs/evaluation.json`, then compute the experimental metrics. `comparison.json` provides the twelve-baseline configuration:
+
+```bash
+skillrecon evaluate --manifest experiments/configs/evaluation.json \
+  --output outputs/evaluation
+```
+
+| Experiment | Inputs and measurements |
+|---|---|
+| RQ1 | Clause/operator recovery, POLICY/KNOWLEDGE classification, authorization gates, effective support, intermediate objects |
+| RQ2 | High/Medium detection, type-specific and broadcast-free F1/TCR, ablations, language and documentation strata, perturbations, parameter/model comparisons |
+| RQ3 | Low-slice discovery, precision/recall and exact binomial confidence intervals |
+| RQ4 | Witness coverage, revalidation, irreducibility, extraction modes, grounding, tier contributions and runtime |
+| Cross-platform | Claude Code/opencode detection and type recall, witness revalidation, paired McNemar with Holm–Bonferroni correction |
+
+Generate the four ablations and documentation variants, and run parameter sweeps:
+
+```bash
+skillrecon ablate --skills-file datasets/main/skills.txt \
+  --data-root data/packages --artifact-root outputs/skillrecon \
+  --output-root outputs/ablations \
+  --llm-config experiments/configs/llm.local.json
+
+skillrecon perturb --plan /path/to/perturbations.jsonl \
+  --source-root data/packages --output-root data/variants
+
+skillrecon sweep --skills /path/to/selected-skills.txt \
+  --data-root data/packages \
+  --llm-config experiments/configs/llm.local.json \
+  --grid experiments/configs/canonical_sweep.json --output outputs/sweep
+```
+
+Analyze each documentation variant with its own data root. Register ablation, variant, model, and parameter outputs in the evaluation configuration. The `sweep --dry-run` option writes the selected run plan.
+
+For cross-platform experiments, prepare `datasets/cross_platform/catalog.jsonl` and run the two supplied platform lists through the same analysis and evaluation commands.
+
+<a id="data"></a>
+
+## Data & Hyperparameters
+
+### Data organization
+
+| Catalog / selection | Collection |
+|---|---|
+| `datasets/main/catalog.jsonl` | 1,500 versioned OpenClaw packages |
+| `datasets/main/{high,medium,low}.txt` | 500 identities per slice |
+| `datasets/main/skills.txt` | Complete main collection |
+| `datasets/cross_platform/catalog.jsonl` | 500 packages with pinned repository revisions and source paths |
+| `datasets/cross_platform/claude_code.txt` | 300 Claude Code packages |
+| `datasets/cross_platform/opencode.txt` | 200 opencode packages |
+
+Prepared data, annotations, and newly generated outputs use this layout:
 
 ```text
-SkillRecon/
-├── src/skillrecon/           Core implementation
-│   ├── core/                 Shared types, enums, frozen configuration
-│   ├── loader/               Package scanning, inline extraction, path resolution
-│   ├── contract/             ICCM clause extraction, classification, voting, G_D
-│   ├── behavior/             CodeQL + Bash + instruction observation, normalization, G_C
-│   ├── reconcile/            Candidate linking, 3-valued predicates, derivation, G_X
-│   ├── detect/               Findings, minimal violation witnesses, validation
-│   ├── evaluation/           Metrics, statistics, tables, figures, human audit
-│   ├── llm/                  OpenAI-compatible client with disk cache
-│   └── visualize/            PyVis rendering and explanatory subgraphs
-├── scripts/                  CLI entry points (pipeline, evaluation, baselines, utilities)
-├── tests/                    Test suite
-├── experiments/
-│   ├── configs/              Taxonomy, overlap policy, Bash patterns, LLM/env configs
-│   ├── prompts/iccm/         Contract-extraction prompt templates
-│   └── codeql/queries/       Python and JavaScript/TypeScript CodeQL queries
-└── data/
-    ├── skill_dataset/        Bundled case-study skill packages
-    ├── evaluation/           Paper dataset: 500 skills × 3 risk levels + gold labels
-    └── test_index/           Curated test-sample indexes
+data/
+  packages/<owner>/<skill>/       # Original package documents and source code
+  variants/<kind>/<owner>/<skill>/
+annotations/
+  main.jsonl                     # Skill-level labels and grouping metadata
+  cross_platform.jsonl
+  rq1_clauses.jsonl               # Clause/operator/role annotations
+  rq1_objects.jsonl               # Intermediate-object annotations
+  witness_grounding.jsonl
+outputs/
+  skillrecon/<owner>/<skill>/     # Analysis and witness outputs
+  internal/                      # Internal baseline outputs
+  <scanner>/                     # External baseline outputs
+  ablations/<configuration>/
+  sweep/<configuration>/
+  evaluation/                    # measurements.json and metrics/*.json,*.csv
 ```
 
-## Requirements
+Annotations and experiment manifests follow the [input schemas](schemas/README.md). Configure each system with an analysis directory, a report directory, or a prediction JSONL. Dataset catalog paths and platform/slice fields identify the selected experimental groups.
 
-- Linux or WSL, Python 3.12+
-- CodeQL CLI (only required to rerun behavior extraction from source)
-- An OpenAI-compatible LLM endpoint (only required to rerun contract extraction)
+### Configurable parameters
 
-## Installation
+The default method uses five extraction passes, a 0.6 voting threshold, eight candidate clauses, and exact witness bounds of 18 nodes / 36 edges.
 
-```bash
-python -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-```
+<details>
+<summary><strong>Model, method, and experiment settings</strong></summary>
 
-Verify the installation:
+| Setting | Default | Configuration / override |
+|---|---|---|
+| Model service, model, authentication | Local Chat Completions service; GLM profile | `llm.local.json`: `base_url`, `model`, `api_key_env`; `--base-url`, `--model`, `--api-key-env` |
+| Temperature / output budget | 0 / 32,768 tokens | `temperature`, `max_tokens`; corresponding CLI options |
+| Structured responses | `json_prompt` | `structured_output_mode`: `json_prompt` or `json_schema` |
+| Response cache | `outputs/llm-cache`, live requests enabled | `cache_root`, `cache_only`; `--cache-root`, `--cache-only` |
+| ICCM passes, n | 5 | `env_config.json` → `vote_policy.n_samples`; `--n-samples` |
+| Vote threshold, θ | 0.6 | `vote_policy.agreement_threshold`; `--theta` |
+| Candidate frontier, k_c | 8 | `reconciliation.max_candidates_per_behavior`; `--max-candidates-per-behavior` |
+| Exact witness bounds | 18 nodes / 36 edges | `reconciliation.witness_max_nodes`, `witness_max_edges`; matching CLI options |
+| Alignment candidates per step | 3 | `reconciliation.max_alignment_fallbacks_per_step`; matching CLI option |
+| Semantic event / path candidates | 3 / 2 | `reconciliation.max_semantic_event_fallbacks`, `max_semantic_path_fallbacks`; matching CLI options |
+| Capability vocabulary / coverage | `taxonomy_v3.json` / `overlap_policy_v2.json` | `experiments/configs/`; `--taxonomy-version`, `--overlap-policy-path` |
+| Extraction prompts | `iccm/v2` | `experiments/prompts/`; `--prompt-version` |
+| CodeQL executable | `codeql` from PATH | `env_config.json` → `codeql.bin`; `--codeql-bin` |
+| Bash capability rules | `bash_patterns.json` | `experiments/configs/bash_patterns.json` |
+| Experiment inputs | Main collection | `evaluation.json`: `gold`, `systems`, optional RQ/variant inputs |
+| Sweep grid | n, θ, k_c, witness bounds | `canonical_sweep.json` or `sweep --grid` |
+| Collection and run paths | Explicit data/output roots | `--catalog`, `--skills-file`, `--data-root`, `--output-dir`, `--limit` |
+| External scanner runtime | Native scanner configuration | `--scanner-python`, `--scanner-config`, `--scanner-arg`; MalSkills TOML model, timeout and analysis-stage switches |
 
-```bash
-python scripts/check_submission_artifact.py
-```
+</details>
 
-Dependencies are listed in `requirements.txt` (runtime) and `requirements-dev.txt`
-(development).
+The ablation configurations are `ablation_no_iccm`, `ablation_no_scope_constraints`, `ablation_no_composition_analysis`, and `ablation_no_authorization_guard`. Documentation perturbations are `missing_authorization`, `stale_resource`, `ambiguous_scope`, and `conflicting_allow_prohibit`. Use `skillrecon <command> --help` for command options.
 
-## Configuration
+---
 
-Copy and edit the two config files under `experiments/configs/`:
-
-- `env_config.json` — CodeQL binary path and reconciliation knobs.
-- `llm_config.json` — OpenAI-compatible LLM endpoint for contract extraction.
-
-```json
-{
-  "base_url": "https://your-endpoint/v1",
-  "model": "your-model-name",
-  "api_key_env": "SKILLRECON_API_KEY",
-  "temperature": 0.0,
-  "max_tokens": 8192,
-  "structured_output_mode": "json_prompt"
-}
-```
-
-`base_url` should stop at the API version root (do not include `/chat/completions`).
-Any OpenAI-compatible provider works. Set your API key in the environment:
-
-```bash
-export SKILLRECON_API_KEY="YOUR_API_KEY"
-```
-
-## Quick Start: Single Skill
-
-Run the full pipeline on one bundled skill:
-
-```bash
-# 1. Contract + behavior extraction + reconciliation + detection
-python scripts/run_full.py \
-  --skill youtube-summary \
-  --data-root data/skill_dataset \
-  --output-dir derived/reviewer_cases \
-  --env-config experiments/configs/env_config.json \
-  --llm-config experiments/configs/llm_config.json \
-  --n-samples 1 \
-  --render-pyvis \
-  --no-pyvis-full-graph
-
-# 2. Evaluation and unified report
-python scripts/run_evaluation.py \
-  --skill youtube-summary \
-  --artifact-dir derived/reviewer_cases/youtube-summary
-
-# 3. Human-readable Markdown report
-python scripts/render_markdown_report.py \
-  --skill youtube-summary \
-  --artifact-dir derived/reviewer_cases/youtube-summary
-```
-
-## Case Studies
-
-The bundled 10-case set covers violations, declared exposures, and benign controls:
-
-```bash
-python scripts/run_reviewer_cases.py --render-pyvis
-```
-
-Outputs land under `derived/reviewer_cases/<skill-id>/`.
-
-## Reading the Outputs
-
-| Priority | File                                                          | Purpose                                                                |
-| -------- | ------------------------------------------------------------- | ---------------------------------------------------------------------- |
-| 1        | `review_report.md`                                          | Human-readable summary; violation / exposure status at a glance. |
-| 2        | `report.json`                                               | Machine-readable unified report.                                       |
-| 3        | `witnesses.json`                                            | Validated witnesses; the evidence-chain entry point.                   |
-| 4        | `witness_validation.json`                                   | Whether each witness passed revalidation.                              |
-| 5        | `viz/<witness-id>-explanatory.html`                         | Minimal explanatory subgraph for one finding.                          |
-| 6        | `findings.json` / `exposures.json` / `diagnostics.json` | Fine-grained structured outputs.                                       |
-| 7        | `g_d.json` / `g_c.json` / `g_x.json`                    | The three graph artifacts.                                             |
-
-## Batch Experiments
-
-The paper evaluates on 500 skills per risk level (low / medium / high, 1,500 total).
-Corpus indexes and gold labels are bundled under `data/evaluation/`. To reproduce:
-
-```bash
-# 1. Per-skill artifacts (resumable; completed skills are skipped unless --force)
-python scripts/run_paper_artifacts.py \
-  --paper-dataset data/evaluation/skill_paper500_dataset \
-  --dataset-root data/skill_dataset \
-  --output-dir derived/paper500 \
-  --staging-root derived/paper500_source_links \
-  --llm-config experiments/configs/llm_config.json \
-  --max-workers 4
-
-# 2. Ablation artifact roots
-python scripts/build_ablation_artifacts.py \
-  --skills-file data/evaluation/skill_paper500_dataset/all_skills.txt \
-  --data-root derived/paper500_source_links \
-  --artifact-root derived/paper500 \
-  --output-root derived/ablations/paper500 \
-  --llm-config experiments/configs/llm_config.json
-
-# 3. Unified experiment runner (RQ1–RQ4, baselines, ablations, extended analyses)
-python scripts/run_experiments.py \
-  --paper-dataset data/evaluation/skill_paper500_dataset \
-  --artifact-root derived/paper500 \
-  --system-artifact-root ablation_no_iccm=derived/ablations/paper500/ablation_no_iccm \
-  --system-artifact-root ablation_no_scope_constraints=derived/ablations/paper500/ablation_no_scope_constraints \
-  --system-artifact-root ablation_no_composition_analysis=derived/ablations/paper500/ablation_no_composition_analysis \
-  --system-artifact-root ablation_no_authorization_guard=derived/ablations/paper500/ablation_no_authorization_guard \
-  --output-dir derived/experiments/paper500
-
-# 4. Bootstrap CIs and McNemar/Holm significance
-python scripts/compute_rq2_statistics.py \
-  --gold-labels data/evaluation/skill_paper500_dataset/gold_labels.jsonl \
-  --artifact-root derived/paper500 \
-  --output-dir derived/experiments/paper500/rq2_stats
-```
-
-## License
-
-MIT. See `LICENSE`.
+Released under the [MIT License](LICENSE).

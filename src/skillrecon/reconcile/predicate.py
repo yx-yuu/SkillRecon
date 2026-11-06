@@ -9,11 +9,21 @@ from __future__ import annotations
 import fnmatch
 import json
 import logging
+import posixpath
+import re
+import shlex
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from urllib.parse import urlparse
 
-from skillrecon.contract.normalize import is_resource_constraint, is_scope_constraint
-from skillrecon.core.enums import HypothesisStatus, PredicateResult, RouteSupport
+from skillrecon.core.config import PROJECT_ROOT
+from skillrecon.contract.steps import extract_step_order
+from skillrecon.contract.controls import CONTROL_TYPES
+from skillrecon.contract.normalize import (
+    is_resource_constraint,
+    looks_typed_constraint_applicable,
+)
+from skillrecon.core.enums import BridgeKind, HypothesisStatus, PredicateResult, RouteSupport
 from skillrecon.core.types import (
     Bridge,
     CandidatePair,
@@ -23,6 +33,9 @@ from skillrecon.core.types import (
     OrchestrationHypothesis,
     ResourceUse,
     RiskPath,
+    Step,
+    StepOrderEdge,
+    ReconciliationJudgment,
 )
 
 logger = logging.getLogger(__name__)
@@ -37,9 +50,9 @@ _NETWORK_CAPABILITIES = {
     "websocket",
     "smtp_send",
     "ssh_connect",
-    "data_upload",
-    "data_encode_send",
-    "dns_lookup",
+    "upload_exfil",
+    "data_encode",
+    "dns_query",
     "socket_connect",
     "ftp_transfer",
 }
@@ -59,10 +72,10 @@ _WRITE_LIKE_CAPABILITIES = {
 }
 _EFFECTFUL_CAPABILITIES = _NETWORK_CAPABILITIES | _WRITE_LIKE_CAPABILITIES | {
     "shell_exec",
-    "subprocess_spawn",
+    "subprocess",
     "dynamic_import",
     "process_kill",
-    "cron_schedule",
+    "cron_write",
 }
 
 
@@ -74,12 +87,21 @@ _OverlapMap = dict[str, set[str]]
 
 
 def load_overlap_policy(policy_path: Path) -> _OverlapMap:
-    """Load capability overlap policy and build bidirectional lookup.
+    """Load the versioned capability relation.
 
-    Returns a dict mapping each atom to the set of atoms it is comparable with
-    (including itself).
+    V1 records legacy comparison families. V2 records directed coverage:
+    a declared capability maps to the event capabilities it authorizes.
     """
-    data = json.loads(policy_path.read_text(encoding="utf-8"))
+    data = json.loads((PROJECT_ROOT / policy_path).read_text(encoding="utf-8"))
+    if data["version"] == "v2":
+        result = {cap: {cap, *covered} for cap, covered in data["coverage"].items()}
+        for cap in result:
+            pending = list(result[cap])
+            while pending:
+                for covered in result.get(pending.pop(), set()) - result[cap]:
+                    result[cap].add(covered)
+                    pending.append(covered)
+        return result
     lookup: _OverlapMap = {}
     for family in data.get("families", []):
         members = set(family["members"])
@@ -98,11 +120,11 @@ def capability_overlaps(
     behavior_cap: str,
     overlap_map: _OverlapMap,
 ) -> PredicateResult:
-    """Check whether clause capability and behavior capability are comparable.
+    """Check declared-capability coverage of the behavior capability.
 
     Rules:
     - exact same atom -> TRUE
-    - configured overlap family hit -> TRUE
+    - configured directed coverage hit -> TRUE
     - atom family explicitly incompatible -> FALSE
     - policy missing or family undecidable -> ABSTAIN
     """
@@ -116,9 +138,6 @@ def capability_overlaps(
         if behavior_cap in family:
             return PredicateResult.TRUE
         return PredicateResult.FALSE
-
-    if not overlap_map:
-        return PredicateResult.ABSTAIN
 
     return PredicateResult.FALSE
 
@@ -139,12 +158,13 @@ def resource_compatible(
     - all resources present and clearly incompatible -> FALSE
     - only unresolved/abstract resources -> ABSTAIN
     """
-    resource_constraints = [
-        constraint for constraint in clause.constraints if is_resource_constraint(constraint)
-    ]
-
-    if not clause.target and not resource_constraints:
-        return PredicateResult.ABSTAIN
+    resources = [r for r in resources if r.resource_type not in {
+        "control_condition", "registered_operation", "registered_route", "required_environment", "request_credential"
+    }]
+    # tau(c) and Sigma(c) are different premises. A failing prefix/domain
+    # constraint belongs to ScopeViol, not to target incompatibility.
+    if not clause.target:
+        return PredicateResult.TRUE
 
     if not resources:
         return PredicateResult.ABSTAIN
@@ -156,14 +176,6 @@ def resource_compatible(
     resolved = [r for r in resources if r.resolved]
     if not resolved:
         return PredicateResult.ABSTAIN
-
-    if not clause.target:
-        if not resource_constraints:
-            return PredicateResult.TRUE
-        for res in resolved:
-            if _any_constraint_matches(resource_constraints, res):
-                return PredicateResult.TRUE
-        return PredicateResult.FALSE
 
     for res in resolved:
         if _resource_matches_clause(clause, res):
@@ -207,8 +219,6 @@ def _path_compatible(clause_target: str, resource_path: str) -> bool:
             value,
             value.lstrip("./"),
             str(value_path),
-            str(PurePosixPath(*value_path.parts[-2:])) if len(value_path.parts) >= 2 else value,
-            value_path.name,
         }
         normalized_target = target.lstrip("./")
         return any(
@@ -216,9 +226,6 @@ def _path_compatible(clause_target: str, resource_path: str) -> bool:
             or fnmatch.fnmatch(candidate, normalized_target)
             for candidate in candidates
         )
-
-    if "/" not in target and target_path.name and target_path.name == value_path.name:
-        return True
 
     # Treat slash-terminated or suffix-less targets as directory scopes.
     if target.endswith("/") or ("/" in target and not target_path.suffix):
@@ -231,6 +238,14 @@ def _path_compatible(clause_target: str, resource_path: str) -> bool:
 
 
 def _domain_compatible(clause_target: str, resource_value: str) -> bool:
+    if "://" in clause_target:
+        return _url_compatible(clause_target, resource_value)
+    if clause_target.rstrip(":") in {"http", "https", "ws", "wss", "ssh", "ftp"}:
+        return urlparse(resource_value).scheme == clause_target.rstrip(":")
+    if re.search(r":\d+$", clause_target):
+        observed = urlparse(resource_value if "://" in resource_value else "//" + resource_value)
+        host, port = clause_target.rsplit(":", 1)
+        return observed.hostname == host.lower() and (observed.port or {"https":443,"http":80}.get(observed.scheme)) == int(port)
     target = _normalize_domain_pattern(clause_target)
     host = _resource_host(resource_value)
     if not host:
@@ -249,8 +264,8 @@ def _domain_compatible(clause_target: str, resource_value: str) -> bool:
 
 
 def _env_compatible(clause_target: str, resource_value: str) -> bool:
-    ct = clause_target.upper()
-    rv = resource_value.upper()
+    ct = clause_target
+    rv = resource_value
     if ct == rv:
         return True
     if _has_glob_syntax(ct):
@@ -259,11 +274,17 @@ def _env_compatible(clause_target: str, resource_value: str) -> bool:
 
 
 def _command_compatible(clause_target: str, resource_value: str) -> bool:
-    ct = PurePosixPath(clause_target.lower()).name
-    rv = PurePosixPath(resource_value.lower()).name
-    if _has_glob_syntax(ct):
-        return fnmatch.fnmatch(rv, ct)
-    return ct == rv
+    selector = clause_target.replace(":*", " *")
+    target = shlex.split(selector)
+    observed = shlex.split(resource_value)
+    if not target or not observed:
+        return False
+    if len(target) == 1:
+        executable = observed[0] if "/" in target[0] else PurePosixPath(observed[0]).name
+        return fnmatch.fnmatchcase(executable, target[0])
+    if any(_has_glob_syntax(part) for part in target):
+        return fnmatch.fnmatchcase(" ".join(observed), " ".join(target))
+    return observed[:len(target)] == target
 
 
 def _any_constraint_matches(
@@ -295,12 +316,15 @@ def scope_satisfied(
     - all relevant constraints satisfied -> TRUE
     - unresolved resources, cannot decide -> ABSTAIN
     """
-    scope_constraints = [
-        constraint for constraint in clause.constraints if is_scope_constraint(constraint)
-    ]
+    resources = [r for r in resources if r.resource_type not in {
+        "registered_operation", "registered_route", "required_environment", "request_credential"
+    }]
+    scope_constraints = clause.constraints
+    if not any(c.constraint_type in CONTROL_TYPES | {"opt_out_env", "account_active", "no_auto_retry"} for c in scope_constraints):
+        resources = [r for r in resources if r.resource_type != "control_condition"]
 
     if not clause.target and not scope_constraints:
-        return PredicateResult.ABSTAIN
+        return PredicateResult.TRUE
 
     if not resources:
         return PredicateResult.ABSTAIN
@@ -309,7 +333,7 @@ def scope_satisfied(
     if all_unresolved:
         return PredicateResult.ABSTAIN
 
-    resolved = [r for r in resources if r.resolved]
+    resolved = resources
 
     if scope_constraints:
         violated = False
@@ -347,6 +371,8 @@ def _check_constraint(
     behavior_capability: str | None = None,
 ) -> PredicateResult:
     """Check a single constraint against resolved resources."""
+    if not looks_typed_constraint_applicable(constraint):
+        return PredicateResult.ABSTAIN
     semantic_status = _semantic_constraint_status(
         constraint,
         resources,
@@ -359,11 +385,12 @@ def _check_constraint(
     if not relevant:
         return PredicateResult.ABSTAIN
 
-    for res in relevant:
-        if _constraint_matches_resource(constraint, res):
-            return PredicateResult.TRUE
-
-    return PredicateResult.FALSE
+    results = [PredicateResult.ABSTAIN if not res.resolved else
+               PredicateResult.TRUE if _constraint_matches_resource(constraint,res) else PredicateResult.FALSE
+               for res in relevant]
+    if PredicateResult.FALSE in results:
+        return PredicateResult.FALSE
+    return PredicateResult.ABSTAIN if PredicateResult.ABSTAIN in results else PredicateResult.TRUE
 
 
 def _constraint_applies_to_resource(
@@ -371,6 +398,20 @@ def _constraint_applies_to_resource(
     resource: ResourceUse,
 ) -> bool:
     ctype = constraint.constraint_type.lower()
+    if ctype in {"var", "cmd"}:
+        return resource.resource_type == {"var":"env_var", "cmd":"command"}[ctype]
+    if ctype in {"opt_out_env", "account_active"}:
+        legacy = {"opt_out_env":"empty_disables", "account_active":"config_enabled"}[ctype]
+        return resource.resource_type == "control_condition" and resource.value in {
+            f"{ctype}:{constraint.value}", f"{legacy}:{constraint.value}"}
+    if ctype == "no_auto_retry":
+        return resource.resource_type == "control_condition" and resource.value == "retry_on_error:automatic_retry"
+    if ctype == "standalone_call":
+        return resource.resource_type == "control_condition" and resource.value in {
+            f"standalone_call:{name}" for name in constraint.value.split('|')}
+    if ctype in CONTROL_TYPES:
+        return (resource.resource_type == "control_condition"
+                and resource.value == f"{ctype}:{constraint.value}")
     compatible_types = {
         "path": {"path"},
         "path_glob": {"path"},
@@ -384,6 +425,11 @@ def _constraint_applies_to_resource(
         "command": {"command"},
         "command_glob": {"command"},
         "query": {"query"},
+        "prefix": {"path"}, "ext": {"path"}, "host": {"url", "domain", "host"},
+        "scheme": {"url"}, "port": {"url", "domain", "host"},
+        "interpreter": {"command"}, "arg_pattern": {"command"},
+        "provenance": {"path", "env_var", "credential", "secret"},
+        "location": {"path", "location"}, "trigger": {"trigger"}, "lifetime": {"lifetime"},
         "user_input_only": {"path", "url", "domain", "command", "env_var", "secret"},
         "config_bound": {"path", "url", "domain"},
         "side_effect_bound": {"path", "url", "domain", "command", "env_var", "query", "secret"},
@@ -397,6 +443,34 @@ def _constraint_matches_resource(
 ) -> bool:
     ctype = constraint.constraint_type.lower()
     value = constraint.value
+    if ctype == "var":
+        return _env_compatible(value,resource.value)
+    if ctype == "cmd":
+        return _command_compatible(value,resource.value)
+
+    if ctype == "prefix":
+        prefix = _normalize_path_pattern(value).rstrip("/")
+        observed = _normalize_path_pattern(resource.value)
+        return observed == prefix or observed.startswith(prefix + "/")
+    if ctype == "ext":
+        return PurePosixPath(resource.value).suffix.lstrip(".").lower() == value.lstrip("*.").lower()
+    if ctype == "host":
+        return _domain_compatible(value, resource.value)
+    if ctype == "scheme":
+        return urlparse(resource.value).scheme == value.rstrip(":/")
+    if ctype == "port":
+        parsed = urlparse(resource.value if "://" in resource.value else "//" + resource.value)
+        return (parsed.port or {"http":80,"https":443,"ssh":22,"ftp":21}.get(parsed.scheme)) == int(value)
+    if ctype == "interpreter":
+        command = shlex.split(resource.value)
+        return bool(command) and PurePosixPath(command[0]).name == value
+    if ctype == "arg_pattern":
+        command = shlex.split(resource.value)
+        return fnmatch.fnmatchcase(" ".join(command[1:]), value)
+    if ctype == "provenance":
+        return resource.origin_kind == value
+    if ctype == "location":
+        return _path_compatible(value,resource.value)
 
     if ctype in {"path", "path_glob", "file_glob"}:
         return resource.resource_type == "path" and _path_compatible(value, resource.value)
@@ -426,6 +500,36 @@ def _semantic_constraint_status(
     behavior_capability: str | None,
 ) -> PredicateResult | None:
     ctype = constraint.constraint_type.lower()
+    if ctype == "read_only":
+        return _side_effect_bound_status("read_only",behavior_capability,resources)
+    if ctype in {"opt_out_env", "account_active"}:
+        relevant = [r for r in resources if _constraint_applies_to_resource(constraint,r)]
+        if not relevant:
+            return PredicateResult.ABSTAIN
+        values = [PredicateResult(json.loads(r.origin_hint)["result"]) if r.resolved
+                  else PredicateResult.ABSTAIN for r in relevant]
+        if PredicateResult.FALSE in values:
+            return PredicateResult.FALSE
+        return PredicateResult.TRUE if all(value==PredicateResult.TRUE for value in values) else PredicateResult.ABSTAIN
+    if ctype == "no_auto_retry":
+        retry = constraint.model_copy(update={"constraint_type": "retry_on_error", "value": "automatic_retry"})
+        result = _semantic_constraint_status(retry,resources,behavior_capability=behavior_capability)
+        return PredicateResult.FALSE if result == PredicateResult.TRUE else PredicateResult.TRUE if result == PredicateResult.FALSE else PredicateResult.ABSTAIN
+    if ctype == "provenance":
+        relevant = [resource for resource in resources if _constraint_applies_to_resource(constraint,resource)]
+        if not relevant or any(resource.origin_kind == "unknown" for resource in relevant):
+            return PredicateResult.ABSTAIN
+    if ctype in CONTROL_TYPES:
+        relevant = [r for r in resources if _constraint_applies_to_resource(constraint, r)]
+        if not relevant:
+            return PredicateResult.ABSTAIN
+        results = [PredicateResult(json.loads(r.origin_hint)["result"]) for r in relevant]
+        if ctype == "standalone_call":
+            if PredicateResult.TRUE in results:return PredicateResult.TRUE
+            return PredicateResult.FALSE if all(result==PredicateResult.FALSE for result in results) else PredicateResult.ABSTAIN
+        if PredicateResult.FALSE in results:
+            return PredicateResult.FALSE
+        return PredicateResult.TRUE if all(r == PredicateResult.TRUE for r in results) else PredicateResult.ABSTAIN
     if ctype == "user_input_only":
         return _user_input_only_status(resources)
     if ctype == "config_bound":
@@ -480,6 +584,8 @@ def _side_effect_bound_status(
             return PredicateResult.FALSE
         return PredicateResult.TRUE
     if normalized == "read_only":
+        if behavior_capability in {'shell_exec','subprocess','dynamic_import'}:
+            return PredicateResult.ABSTAIN
         if behavior_capability in _EFFECTFUL_CAPABILITIES:
             return PredicateResult.FALSE
         if behavior_capability in _READ_LIKE_CAPABILITIES:
@@ -516,7 +622,8 @@ def _normalize_domain_pattern(value: str) -> str:
 
 
 def _normalize_path_pattern(value: str) -> str:
-    return PurePosixPath(value.replace("\\", "/")).as_posix().lower()
+    normalized = posixpath.normpath(value.replace("\\", "/"))
+    return normalized + "/" if value.endswith("/") and normalized != "/" else normalized
 
 
 def _has_glob_syntax(value: str) -> bool:
@@ -539,7 +646,7 @@ def prohibition_conflict(
     Rules:
     - capability_overlaps = false -> FALSE
     - broad prohibition (no target/constraint) + capability overlap -> TRUE
-    - targeted prohibition needs resource_compatible or scope_satisfied
+    - targeted prohibition needs its target and every constraint satisfied
     - only unresolved resources / unresolved route -> ABSTAIN
     """
     cap_result = capability_overlaps(clause, behavior_cap, overlap_map)
@@ -551,22 +658,19 @@ def prohibition_conflict(
     if not clause.target and not clause.constraints:
         return PredicateResult.TRUE
 
-    res_result = resource_compatible(clause, resources)
-    if res_result == PredicateResult.TRUE:
-        return PredicateResult.TRUE
-
+    trigger_clause = clause.model_copy(update={"constraints": [
+        constraint.model_copy(update={"constraint_type": "retry_on_error", "value": "automatic_retry"})
+        if constraint.constraint_type == "no_auto_retry" else constraint for constraint in clause.constraints]})
     scope_result = scope_satisfied(
-        clause,
+        trigger_clause,
         resources,
         behavior_capability=behavior_cap,
     )
-    if scope_result == PredicateResult.TRUE:
-        return PredicateResult.TRUE
-
-    if res_result == PredicateResult.ABSTAIN or scope_result == PredicateResult.ABSTAIN:
-        return PredicateResult.ABSTAIN
-
-    return PredicateResult.FALSE
+    if scope_result != PredicateResult.TRUE:
+        return scope_result
+    if clause.target or any(is_resource_constraint(c) for c in clause.constraints):
+        return resource_compatible(clause, resources)
+    return PredicateResult.TRUE
 
 
 # ---------------------------------------------------------------------------
@@ -588,6 +692,7 @@ def execution_route_justified(
     Rules:
     - local event -> TRUE (local)
     - codeql path -> TRUE (codeql)
+    - registered source-slot path -> TRUE (local)
     - bridge path with all bridges resolved -> TRUE (bridge)
     - orchestration confirmed -> TRUE (orchestration_confirmed)
     - orchestration unresolved/competing -> ABSTAIN (orchestration_unresolved)
@@ -599,6 +704,8 @@ def execution_route_justified(
     if candidate.behavior_kind == BehaviorKind.EVENT:
         event = events.get(candidate.event_id or "")
         if event is None:
+            return PredicateResult.FALSE, None
+        if candidate.shared_signals.get("route_disjoint") == "true":
             return PredicateResult.FALSE, None
         if event.tier == "instruction":
             return PredicateResult.ABSTAIN, RouteSupport.WEAK
@@ -627,13 +734,33 @@ def _evaluate_path_route(
     if ev_level == "codeql":
         return PredicateResult.TRUE, RouteSupport.CODEQL
 
+    if ev_level == "registered_source":
+        return PredicateResult.TRUE, RouteSupport.LOCAL
+
     if ev_level == "bridge":
-        all_resolved = all(
-            bid in bridges for bid in path.bridges_used
-        )
-        if all_resolved and path.bridges_used:
-            return PredicateResult.TRUE, RouteSupport.BRIDGE
-        return PredicateResult.ABSTAIN, RouteSupport.WEAK
+        if not path.bridges_used or any(bid not in bridges for bid in path.bridges_used):
+            return PredicateResult.ABSTAIN, RouteSupport.WEAK
+        sequence=[path.source,*path.segments,path.sink]
+        units=[item.unit_id for index,item in enumerate(sequence)
+               if index==0 or item.unit_id!=sequence[index-1].unit_id]
+        transitions=list(zip(units,units[1:]))
+        if len(transitions)!=len(path.bridges_used):
+            return PredicateResult.FALSE, None
+        event_ids={item.event_id for item in sequence if item.event_id}
+        for (source,target),identifier in zip(transitions,path.bridges_used):
+            bridge=bridges[identifier]
+            direction=(bridge.source_unit_id,bridge.target_unit_id)
+            if direction!=(source,target) and not (
+                    bridge.kind==BridgeKind.STATIC and direction==(target,source)):
+                return PredicateResult.FALSE, None
+            # An invocation/artifact path carries the event that transports the
+            # value. An unrelated bridge ID cannot confirm endpoint co-occurrence.
+            endpoints=[bridge.source_event_id,bridge.target_event_id]
+            if bridge.kind in {BridgeKind.COMMAND,BridgeKind.ARTIFACT} and not bridge.source_event_id:
+                return PredicateResult.ABSTAIN, RouteSupport.WEAK
+            if any(event_id not in event_ids for event_id in endpoints if event_id):
+                return PredicateResult.ABSTAIN, RouteSupport.WEAK
+        return PredicateResult.TRUE, RouteSupport.BRIDGE
 
     if path.orchestration_hypotheses:
         statuses = []
@@ -650,6 +777,201 @@ def _evaluate_path_route(
         return PredicateResult.ABSTAIN, RouteSupport.WEAK
 
     if not ev_level:
-        return PredicateResult.TRUE, RouteSupport.LOCAL
+        return PredicateResult.ABSTAIN, RouteSupport.WEAK
 
     return PredicateResult.FALSE, None
+
+
+@dataclass(frozen=True)
+class PathJustification:
+    result: PredicateResult
+    supporting_judgment_ids: list[str] = field(default_factory=list)
+    abstain_reason: str | None = None
+    notes: str = ""
+    evidence_refs: list[str] = field(default_factory=list)
+
+
+def path_justified(
+    *,
+    required_event_ids: list[str],
+    auth_results_by_event: dict[str, list[ReconciliationJudgment]],
+    clauses: dict[str, Clause],
+    steps_by_id: dict[str, Step],
+    path: RiskPath | None = None,
+    events: dict[str, CapabilityEvent] | None = None,
+    resources_by_event: dict[str, list[ResourceUse]] | None = None,
+    step_order_edges: list[StepOrderEdge] | None = None,
+) -> PathJustification:
+    if step_order_edges is None:
+        semantic_edges, unresolved_steps = extract_step_order(list(steps_by_id.values()))
+    else:
+        # G_D is authoritative: reading order is not execution order. Portable
+        # witnesses must supply the actual normative edges they rely on.
+        semantic_edges = [edge for edge in step_order_edges if edge.relation == "precedes"]
+        unresolved_steps = {step.step_id for step in steps_by_id.values() if step.unresolved_order}
+    successors: dict[str, set[str]] = {}
+    for edge in semantic_edges:
+        successors.setdefault(edge.source_step_id, set()).add(edge.target_step_id)
+    reachable: dict[str, set[str]] = {}
+    for source in successors:
+        frontier = list(successors[source])
+        visited: set[str] = set()
+        while frontier:
+            target = frontier.pop()
+            if target in visited:
+                continue
+            visited.add(target)
+            frontier.extend(successors.get(target, set()))
+        reachable[source] = visited
+
+    option_sets: list[list[tuple[str, str | None]]] = []
+    for event_id in required_event_ids:
+        options: list[tuple[str, str | None]] = []
+        for judgment in auth_results_by_event.get(event_id, []):
+            if judgment.result != PredicateResult.TRUE:
+                continue
+            clause_id = next((ref for ref in judgment.subject_refs if ref in clauses), None)
+            if clause_id is None:
+                continue
+            options.extend(
+                (judgment.judgment_id, step_id)
+                for step_id in (clauses[clause_id].step_ids or [None])
+            )
+        if not options:
+            return PathJustification(
+                result=PredicateResult.FALSE,
+                notes=f"missing_support:{event_id}",
+            )
+        option_sets.append(options)
+
+    frontier_note = "explicit_order_incompatible"
+    uncertain_solution: tuple[str, list[str], list[str]] | None = None
+    chosen_clause_ids: list[str] = []
+    conflict_steps: set[str] = set()
+
+    def search(
+        index: int,
+        chosen_steps: list[str],
+        chosen_judgment_ids: list[str],
+        uncertainty: str | None,
+    ) -> tuple[list[str], list[str]] | None:
+        nonlocal frontier_note, uncertain_solution
+        if index >= len(option_sets):
+            if path is not None:
+                joint = _joint_path_scope(
+                    clauses[chosen_clause_ids[0]], clauses[chosen_clause_ids[-1]],
+                    path, events or {}, resources_by_event or {},
+                )
+                if joint == PredicateResult.FALSE:
+                    frontier_note = "data_movement_scope_conflict"
+                    return None
+                if joint == PredicateResult.ABSTAIN:
+                    uncertainty = "unresolved_data_movement_scope"
+            if uncertainty is not None:
+                uncertain_solution = (uncertainty, chosen_judgment_ids, chosen_steps)
+                return None
+            return chosen_judgment_ids, chosen_steps
+
+        for judgment_id, step_id in option_sets[index]:
+            required_before = reachable.get(step_id, set()) if step_id is not None else set()
+            conflict = next(
+                (
+                    step for step in chosen_steps
+                    if step in required_before
+                ),
+                None,
+            )
+            if conflict is not None:
+                frontier_note = f"order_conflict:{step_id}->{conflict}"
+                conflict_steps.update((step_id, conflict))
+                continue
+            next_uncertainty = uncertainty
+            if step_id is not None:
+                if step_id not in steps_by_id:
+                    next_uncertainty = "missing_step_evidence"
+                elif step_id in unresolved_steps:
+                    next_uncertainty = "unresolved_step_order"
+            clause_id = next(ref for ref in
+                next(j for group in auth_results_by_event.values() for j in group
+                     if j.judgment_id == judgment_id).subject_refs if ref in clauses)
+            chosen_clause_ids.append(clause_id)
+            result = search(
+                index + 1,
+                [*chosen_steps, *([step_id] if step_id is not None else [])],
+                [*chosen_judgment_ids, judgment_id],
+                next_uncertainty,
+            )
+            chosen_clause_ids.pop()
+            if result is not None:
+                return result
+        return None
+
+    solution = search(0, [], [], None)
+    if solution is not None:
+        return PathJustification(
+            result=PredicateResult.TRUE,
+            supporting_judgment_ids=solution[0],
+            evidence_refs=solution[1],
+            notes="explicit_order_compatible_clause_sequence",
+        )
+    if uncertain_solution is not None:
+        return PathJustification(
+            result=PredicateResult.ABSTAIN,
+            abstain_reason=uncertain_solution[0],
+            supporting_judgment_ids=uncertain_solution[1],
+            evidence_refs=uncertain_solution[2],
+            notes=uncertain_solution[0],
+        )
+    return PathJustification(
+        result=PredicateResult.FALSE,
+        notes=frontier_note,
+        evidence_refs=sorted(conflict_steps),
+    )
+
+
+
+def _joint_path_scope(source_clause, sink_clause, path, events, resources_by_event):
+    """Definition B.4 obligations concern the source/sink pairing."""
+    source_id, sink_id = path.source.event_id, path.sink.event_id
+    source_resources = resources_by_event.get(source_id, [])
+    sink_resources = resources_by_event.get(sink_id, [])
+    source_event = events.get(source_id)
+    constraints = [constraint for clause in (source_clause,sink_clause)
+                   for constraint in clause.constraints
+                   if constraint.constraint_type in {"source_class","sink_domain","separate_invocation"}]
+    results = []
+    for constraint in constraints:
+        if constraint.constraint_type == "sink_domain":
+            destinations = [resource for resource in sink_resources if resource.resource_type == "url"]
+            if not destinations:
+                destinations = [resource for resource in sink_resources if resource.resource_type in {"domain","host"}]
+            statuses = [PredicateResult.ABSTAIN if not r.resolved else
+                        PredicateResult.TRUE if _domain_compatible(constraint.value,r.value) else PredicateResult.FALSE
+                        for r in destinations]
+            if statuses and all(status == PredicateResult.TRUE for status in statuses):
+                results.append(PredicateResult.TRUE)
+            elif statuses and all(status == PredicateResult.FALSE for status in statuses):
+                results.append(PredicateResult.FALSE)
+            else:
+                results.append(PredicateResult.ABSTAIN)
+        elif constraint.constraint_type == "source_class":
+            explicit = [resource.value for resource in source_resources
+                        if resource.resource_type=="source_class" and resource.resolved]
+            cap = source_event.capability if source_event else ""
+            classes = set(explicit)
+            if cap in {"env_var_read","token_file_read","api_key_use","keychain_access","credential_store_access"}:
+                classes.update({"credential","credentials","secret","secrets"})
+            elif cap == "file_read":
+                classes.add("file")
+            classes.update(resource.origin_kind for resource in source_resources
+                           if resource.origin_kind not in {"unknown","code_literal","native_ast"})
+            results.append(PredicateResult.ABSTAIN if not classes else
+                           PredicateResult.TRUE if constraint.value in classes else PredicateResult.FALSE)
+        else:
+            source_invocations = {r.value for r in source_resources if r.resource_type=="invocation" and r.resolved}
+            sink_invocations = {r.value for r in sink_resources if r.resource_type=="invocation" and r.resolved}
+            results.append(PredicateResult.ABSTAIN if not source_invocations or not sink_invocations else
+                           PredicateResult.TRUE if source_invocations.isdisjoint(sink_invocations) else PredicateResult.FALSE)
+    if PredicateResult.FALSE in results:
+        return PredicateResult.FALSE
+    return PredicateResult.ABSTAIN if PredicateResult.ABSTAIN in results else PredicateResult.TRUE

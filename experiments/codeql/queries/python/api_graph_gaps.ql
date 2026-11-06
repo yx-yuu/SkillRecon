@@ -13,6 +13,7 @@
 import python
 import semmle.python.dataflow.new.DataFlow
 import semmle.python.ApiGraphs
+import SkillReconPathlib
 
 // ---------------------------------------------------------------------------
 // Tier 2: API-Graph gap fillers for Concepts blind spots
@@ -40,7 +41,7 @@ predicate isEnvVarAccess(DataFlow::Node node, string detail) {
   // os.environ["KEY"] (subscript access)
   exists(API::Node sub |
     sub = API::moduleImport("os").getMember("environ").getASubscript() and
-    node = sub.asSink() and
+    node = sub.asSource() and
     detail = "os.environ[]"
   )
 }
@@ -227,6 +228,8 @@ from DataFlow::Node node, string capType, string detail
 where
   (isEnvVarAccess(node, detail) and capType = "env_var_read")
   or
+  (skillReconPathlibRead(node) and capType = "file_read" and detail = "pathlib read result")
+  or
   (isDynamicImport(node, detail) and capType = "dynamic_import")
   or
   (isDotenvRead(node, detail) and capType = "token_file_read")
@@ -237,12 +240,12 @@ where
   or
   (isWebSocket(node, detail) and capType = "websocket")
   or
-  (isDnsLookup(node, detail) and capType = "dns_lookup")
+  (isDnsLookup(node, detail) and capType = "dns_query")
   or
   (isSmtpSend(node, detail) and capType = "smtp_send")
   or
   (isScraplingFetch(node, detail) and capType = "http_request")
   or
-  (isCronSchedule(node, detail) and capType = "cron_schedule")
+  (isCronSchedule(node, detail) and capType = "cron_write")
 select node,
   "capType=" + capType + " | detail=" + detail + " | tier=api_graph"

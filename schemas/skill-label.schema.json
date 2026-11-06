@@ -1,0 +1,209 @@
+{
+  "$defs": {
+    "ClauseAnnotation": {
+      "description": "A gold clause record used for RQ1 contract-induction evaluation.",
+      "properties": {
+        "signature": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Signature"
+        },
+        "operator": {
+          "title": "Operator",
+          "type": "string"
+        },
+        "capability": {
+          "title": "Capability",
+          "type": "string"
+        },
+        "target": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Target"
+        },
+        "constraints": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Constraints",
+          "type": "array"
+        },
+        "evidence_refs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "operator",
+        "capability"
+      ],
+      "title": "ClauseAnnotation",
+      "type": "object"
+    },
+    "EdgeAnnotation": {
+      "description": "A gold reconciliation-edge record used for RQ1 sampled edge accuracy.",
+      "properties": {
+        "edge_type": {
+          "title": "Edge Type",
+          "type": "string"
+        },
+        "signature": {
+          "title": "Signature",
+          "type": "string"
+        },
+        "expected_correct": {
+          "default": true,
+          "title": "Expected Correct",
+          "type": "boolean"
+        },
+        "evidence_refs": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Evidence Refs",
+          "type": "array"
+        }
+      },
+      "required": [
+        "edge_type",
+        "signature"
+      ],
+      "title": "EdgeAnnotation",
+      "type": "object"
+    },
+    "GoldLabel": {
+      "description": "The single supervision field used by evaluation datasets.",
+      "properties": {
+        "label": {
+          "enum": [
+            "violation",
+            "exposure-only",
+            "benign"
+          ],
+          "title": "Label",
+          "type": "string"
+        },
+        "violation_subtype": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Violation Subtype"
+        },
+        "violation_subtypes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Violation Subtypes",
+          "type": "array"
+        },
+        "rationale": {
+          "default": "",
+          "title": "Rationale",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "title": "GoldLabel",
+      "type": "object"
+    }
+  },
+  "description": "One skill-level record whose supervision is stored only in ``gold``.",
+  "properties": {
+    "skill_id": {
+      "title": "Skill Id",
+      "type": "string"
+    },
+    "gold": {
+      "$ref": "#/$defs/GoldLabel"
+    },
+    "risk_stratum": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Risk Stratum"
+    },
+    "bucket": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Bucket"
+    },
+    "clause_labels": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ClauseAnnotation"
+      },
+      "title": "Clause Labels",
+      "type": "array"
+    },
+    "edge_labels": {
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/EdgeAnnotation"
+      },
+      "title": "Edge Labels",
+      "type": "array"
+    },
+    "expected_sites": {
+      "default": [],
+      "items": {
+        "type": "string"
+      },
+      "title": "Expected Sites",
+      "type": "array"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "default": {},
+      "title": "Metadata",
+      "type": "object"
+    }
+  },
+  "required": [
+    "skill_id",
+    "gold"
+  ],
+  "title": "GoldLabelRecord",
+  "type": "object"
+}

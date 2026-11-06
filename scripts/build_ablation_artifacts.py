@@ -11,6 +11,8 @@ from skillrecon.core.config import (
     DEFAULT_ENV_CONFIG_PATH,
     DEFAULT_LLM_CONFIG_PATH,
     AnalyzerConfig,
+    ReconciliationPolicy,
+    VotePolicy,
     load_env_config,
     resolve_llm_config,
 )
@@ -29,7 +31,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--data-root",
-        default="data/skill_dataset",
+        default="data/packages",
         help="Root directory containing local skill packages",
     )
     parser.add_argument(
@@ -39,7 +41,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--output-root",
-        default="derived/ablations",
+        default="outputs/ablations",
         help="Root directory for ablation artifact outputs",
     )
     parser.add_argument(
@@ -57,14 +59,15 @@ def main() -> None:
     parser.add_argument("--api-key-env", help="API key env var or literal key override")
     parser.add_argument("--temperature", type=float, help="LLM temperature override")
     parser.add_argument("--max-tokens", type=int, help="LLM max_tokens override")
+    parser.add_argument("--theta", type=float, help="Use the main run's ICCM agreement threshold (default 0.6)")
     parser.add_argument(
         "--taxonomy-version",
-        default="v2",
-        help="Taxonomy version suffix, e.g. v2 -> taxonomy_v2.json",
+        default="v3",
+        help="Taxonomy version suffix, v3 selects taxonomy_v3.json",
     )
     parser.add_argument(
         "--prompt-version",
-        default="v1",
+        default="v2",
         help="Prompt version for analyzer config",
     )
     parser.add_argument(
@@ -88,8 +91,13 @@ def main() -> None:
         )
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
+    vote_policy=env_config.vote_policy if env_config is not None else VotePolicy()
+    if args.theta is not None:
+        vote_policy=vote_policy.model_copy(update={"agreement_threshold":args.theta})
     analyzer_config = AnalyzerConfig(
         llm=llm_config,
+        vote_policy=vote_policy,
+        reconciliation_policy=env_config.reconciliation if env_config is not None else ReconciliationPolicy(),
         taxonomy_version=args.taxonomy_version,
         prompt_version=args.prompt_version,
     )

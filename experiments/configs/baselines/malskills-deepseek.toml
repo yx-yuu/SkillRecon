@@ -1,0 +1,19 @@
+# Native MalSkills 0.1.0 configuration. Credentials are environment-only.
+# Set MALSKILLS_LLM_BASE_URL and MALSKILLS_LLM_API_KEY.
+[llm]
+mode = "api"
+model = "deepseek-v4-flash"
+timeout_sec = 300
+enable_thinking = false
+
+[llm.sso_extraction]
+enabled = true
+
+[llm.object_analysis]
+enabled = true
+
+[llm.pattern_reasoning]
+enabled = true
+
+[llm.rule_feedback]
+enabled = false

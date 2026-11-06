@@ -1,0 +1,64 @@
+{
+  "description": "A normalized baseline prediction for one skill.",
+  "properties": {
+    "skill_id": {
+      "title": "Skill Id",
+      "type": "string"
+    },
+    "system_id": {
+      "title": "System Id",
+      "type": "string"
+    },
+    "main_label": {
+      "enum": [
+        "violation",
+        "exposure-only",
+        "benign"
+      ],
+      "title": "Main Label",
+      "type": "string"
+    },
+    "subtype": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Subtype"
+    },
+    "rationale": {
+      "default": "",
+      "title": "Rationale",
+      "type": "string"
+    },
+    "score": {
+      "anyOf": [
+        {
+          "type": "number"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "default": null,
+      "title": "Score"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "default": {},
+      "title": "Metadata",
+      "type": "object"
+    }
+  },
+  "required": [
+    "skill_id",
+    "system_id",
+    "main_label"
+  ],
+  "title": "BaselinePredictionRecord",
+  "type": "object"
+}

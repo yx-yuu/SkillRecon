@@ -1,0 +1,9 @@
+{
+  "version": "v2",
+  "description": "Directed declared-capability coverage. Exact atoms cover themselves. Taxonomy family membership alone does not grant authorization; independent transports and unspecified upload protocols remain distinct.",
+  "coverage": {
+    "file_read": ["token_file_read"],
+    "file_write": ["temp_file_create"],
+    "subprocess": ["shell_exec"]
+  }
+}

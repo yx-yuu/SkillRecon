@@ -84,3 +84,26 @@ def holm_correction(p_values: dict[str, float], *, alpha: float = 0.05) -> dict[
             continue
         break
     return decisions
+
+
+def holm_adjusted(p_values: dict[str, float]) -> dict[str, float]:
+    """Monotone Holm-Bonferroni adjusted two-sided p-values."""
+    ordered = sorted(p_values.items(), key=lambda item: item[1])
+    result = {}
+    previous = 0.0
+    for index, (name, value) in enumerate(ordered):
+        previous = max(previous, min(1.0, (len(ordered)-index)*value))
+        result[name] = previous
+    return result
+
+
+def exact_binomial_ci(successes: int, trials: int, confidence: float = 0.95):
+    """Clopper-Pearson interval, including exact zero/all-success boundaries."""
+    from scipy.stats import beta
+    if not 0 <= successes <= trials:
+        raise ValueError("Expected 0 <= successes <= trials")
+    if trials == 0:
+        return None
+    alpha = 1-confidence
+    return [0.0 if successes == 0 else float(beta.ppf(alpha/2, successes, trials-successes+1)),
+            1.0 if successes == trials else float(beta.ppf(1-alpha/2, successes+1, trials-successes))]

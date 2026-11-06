@@ -26,6 +26,7 @@ from skillrecon.core.types import (
 from skillrecon.reconcile.candidate import generate_alignment_candidates, generate_candidates
 from skillrecon.reconcile.derivation import derive_alignment_edges, materialize_reconciliation
 from skillrecon.reconcile.predicate import load_overlap_policy
+from skillrecon.contract.requirements import preserve_command_conditions
 
 logger = logging.getLogger(__name__)
 
@@ -67,6 +68,9 @@ class ReconciliationPipeline:
         skill_dir.mkdir(parents=True, exist_ok=True)
 
         overlap_map = load_overlap_policy(self._overlap_policy_path)
+        contract_table = contract_table.model_copy(update={
+            'clauses': preserve_command_conditions(contract_table.clauses),
+        })
         policy_contract_table = _policy_only_contract_table(contract_table)
         self._save_artifact(
             skill_dir / "reconcile_contract_table.json",
@@ -111,6 +115,19 @@ class ReconciliationPipeline:
             skill_dir / "alignment_candidates.json",
             [candidate.model_dump() for candidate in alignment_candidates],
         )
+        replay_inputs = {
+            "schema_version": 1,
+            "contract": policy_contract_table.model_dump(),
+            "candidates": [c.model_dump() for c in candidates],
+            "events": [e.model_dump() for e in events],
+            "resources": [r.model_dump() for r in resources],
+            "paths": [p.model_dump() for p in paths],
+            "bridges": [b.model_dump() for b in bridges],
+            "orchestrations": [o.model_dump() for o in orchestrations],
+            "overlap_map": {key: sorted(value) for key, value in overlap_map.items()},
+            "a_req": sorted(self._a_req),
+        }
+        self._save_artifact(skill_dir / "replay_inputs.json", replay_inputs)
 
         clauses_map = {c.clause_id: c for c in policy_contract_table.clauses}
         events_map = {e.event_id: e for e in events}
@@ -135,6 +152,7 @@ class ReconciliationPipeline:
             overlap_map=overlap_map,
             a_req=self._a_req,
             steps_by_id={step.step_id: step for step in policy_contract_table.steps},
+            step_order_edges=policy_contract_table.step_order_edges,
         )
         alignment_edges = derive_alignment_edges(
             alignment_candidates=alignment_candidates,
@@ -157,17 +175,10 @@ class ReconciliationPipeline:
             [e.model_dump() for e in result.edges],
         )
 
-        g_x = _build_g_x(
-            result.judgments,
-            result.certificates,
-            result.edges,
-            policy_contract_table,
-            manifest,
-            events,
-            resources,
-            paths,
-        )
-        self._save_artifact(skill_dir / "g_x.json", g_x)
+        from skillrecon.detect.evidence_graph import build_evidence_graph
+        g_x = build_evidence_graph(replay_inputs,result.judgments,result.certificates,result.edges)
+        self._save_artifact(skill_dir / "g_x.json", {
+            "nodes":list(g_x["nodes"].values()), "edges":list(g_x["edges"].values())})
 
         logger.info(
             "Reconciliation complete: %d candidates -> %d judgments, %d certificates, %d edges",

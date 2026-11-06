@@ -11,8 +11,10 @@ import logging
 import math
 import re
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path, PurePosixPath
 
+from skillrecon.contract.controls import CONTROL_TYPES
 from skillrecon.core.enums import BehaviorKind, CandidateSource
 from skillrecon.core.sensitivity import event_requires_authorization
 from skillrecon.core.types import (
@@ -32,7 +34,7 @@ from skillrecon.core.types import (
 from skillrecon.reconcile.predicate import _OverlapMap, load_overlap_policy
 
 logger = logging.getLogger(__name__)
-_DEFAULT_OVERLAP_POLICY_PATH = Path("experiments/configs/overlap_policy_v1.json")
+_DEFAULT_OVERLAP_POLICY_PATH = Path("experiments/configs/overlap_policy_v2.json")
 
 
 # ---------------------------------------------------------------------------
@@ -71,6 +73,8 @@ class _BehaviorIndex:
             idx.events_by_unit.setdefault(ev.unit_id, []).append(ev)
             idx.events_by_cap.setdefault(ev.capability, []).append(ev)
         for res in resources:
+            if res.resource_type in {"registered_operation", "registered_route", "required_environment", "request_credential"}:
+                continue
             idx.resources_by_value.setdefault(res.value.lower(), []).append(res)
             if res.event_id:
                 idx.resources_by_event.setdefault(res.event_id, []).append(res)
@@ -132,106 +136,92 @@ def generate_candidates(
     max_semantic_event_fallbacks: int = 3,
     max_semantic_path_fallbacks: int = 2,
 ) -> list[CandidatePair]:
-    """Generate candidate pairs from deterministic sources.
+    """Algorithm A1: rank all governing clauses using exactly Equation A2."""
+    from skillrecon.core.config import PROJECT_ROOT
+    import json
 
-    The returned list is deduplicated by (clause_id, behavior_kind, object_id).
-    ``max_candidates_per_behavior`` implements the paper's top-k candidate
-    retrieval bound over each behavior object; set it to ``None`` to disable
-    this cap for diagnostic runs.
-    """
     bidx = _BehaviorIndex.build(events, resources, paths, bridges, orchestrations)
     pidx = _PackageIndex.build(manifest)
-    effective_overlap_map = overlap_map
-    if effective_overlap_map is None:
-        effective_overlap_map = (
-            load_overlap_policy(_DEFAULT_OVERLAP_POLICY_PATH)
-            if _DEFAULT_OVERLAP_POLICY_PATH.is_file()
-            else {}
-        )
+    overlap_map = overlap_map if overlap_map is not None else load_overlap_policy(
+        PROJECT_ROOT / "experiments/configs/overlap_policy_v2.json")
+    taxonomy = json.loads((PROJECT_ROOT / "experiments/configs/taxonomy_v3.json").read_text())
+    families = {atom: family for family, spec in taxonomy["categories"].items() for atom in spec["atoms"]}
+    alignments = generate_alignment_candidates(
+        steps=contract_table.steps, manifest=manifest, max_fallbacks_per_step=max_alignment_fallbacks_per_step)
+    aligned = {(item.step_id, item.code_unit_id) for item in alignments}
+    policies = [clause for clause in contract_table.clauses if clause.role.value == "policy"]
+    adjacency = {}
+    for bridge in bridges:
+        adjacency.setdefault(bridge.source_unit_id,set()).add(bridge.target_unit_id)
 
-    aggregated_hits: dict[
-        tuple[str, str, str],
-        tuple[BehaviorKind, str, list[CandidateSource], dict[str, str], list[str]],
-    ] = {}
-    alignment_hits_by_clause, aligned_units_by_clause = _alignment_backfill_candidates(
-        contract_table=contract_table,
-        bidx=bidx,
-        manifest=manifest,
-        overlap_map=effective_overlap_map,
-        a_req=a_req,
-        max_fallbacks_per_step=max_alignment_fallbacks_per_step,
-    )
+    def reached(roots):
+        result, pending = set(roots), list(roots)
+        while pending:
+            for target in adjacency.get(pending.pop(),set()) - result:
+                result.add(target)
+                pending.append(target)
+        return result
 
-    for clause in contract_table.clauses:
-        pairs = _deterministic_candidates(
-            clause,
-            bidx,
-            pidx,
-            manifest,
-            effective_overlap_map,
-            a_req,
-            max_semantic_event_fallbacks=max_semantic_event_fallbacks,
-            max_semantic_path_fallbacks=max_semantic_path_fallbacks,
-        )
-        pairs.extend(alignment_hits_by_clause.get(clause.clause_id, []))
-        for bkind, obj_id, sources, signals, route_refs in pairs:
-            sources, signals = _annotate_alignment_context(
-                clause=clause,
-                behavior_kind=bkind,
-                object_id=obj_id,
-                candidate_sources=sources,
-                shared_signals=signals,
-                bidx=bidx,
-                aligned_units_by_clause=aligned_units_by_clause,
-            )
-            key = (clause.clause_id, bkind.value, obj_id)
-            if key in aggregated_hits:
-                existing = aggregated_hits[key]
-                aggregated_hits[key] = (
-                    existing[0],
-                    existing[1],
-                    _merge_candidate_sources([*existing[2], *sources]),
-                    {**existing[3], **signals},
-                    list(dict.fromkeys([*existing[4], *route_refs])),
-                )
-                continue
-            aggregated_hits[key] = (
-                bkind,
-                obj_id,
-                list(sources),
-                dict(signals),
-                list(route_refs),
-            )
+    result = []
+    for event in events:
+        event_resources = bidx.resources_by_event.get(event.event_id, [])
+        event_tokens = _event_semantic_tokens(event,event_resources)
+        scored = []
+        for clause in policies:
+            text = " ".join(span.text for span in clause.evidence_spans)
+            literals = {value for value in [clause.target,*[c.value for c in clause.constraints]] if value}
+            literal = any(resource.value in literals for resource in event_resources)
+            literal |= any(resource.resource_type=='control_condition' and
+                resource.value==f'{constraint.constraint_type}:{value}'
+                for resource in event_resources for constraint in clause.constraints
+                for value in constraint.value.split('|'))
+            linked = any(link.source_doc_id in clause.source_doc_ids and link.target_unit_id == event.unit_id
+                         for link in manifest.links)
+            filename = pidx.file_by_id.get(next((unit.file_id for unit in manifest.code_units
+                                                if unit.unit_id == event.unit_id),""),event.file_path)
+            mention = bool(filename and (filename in text or PurePosixPath(filename).name in text))
+            unit_match = any((step,event.unit_id) in aligned for step in clause.step_ids)
+            if clause.bound_event_ids:
+                unit_match = event.event_id in clause.bound_event_ids
+            family = (event.capability == clause.capability
+                      or event.capability in overlap_map.get(clause.capability,set())
+                      or families.get(event.capability) is not None
+                         and families.get(event.capability) == families.get(clause.capability))
+            lexical, shared, cosine = _semantic_score(_clause_semantic_tokens(clause),event_tokens)
+            similarity = max(lexical,cosine)
+            score = 40*literal + 35*linked + 30*mention + 25*unit_match + 20*family + 10*similarity
+            sources = [source for flag,source in [(literal,CandidateSource.LITERAL_OVERLAP),
+                       (linked,CandidateSource.PACKAGE_LINK),(mention,CandidateSource.FILE_MENTION),
+                       (unit_match,CandidateSource.STEP_UNIT_ALIGNMENT),(family,CandidateSource.TYPED_RESOURCE_FAMILY)]
+                       if flag]
+            if similarity:
+                sources.append(CandidateSource.SEMANTIC_RETRIEVAL)
+            signals = {"score":str(score), "literal_overlap":str(literal).lower(),
+                       "document_link":str(linked).lower(), "file_mention":str(mention).lower(),
+                       "unit_alignment":str(unit_match).lower(), "capability_comparable":str(family).lower(),
+                       "semantic_score":str(similarity), "token_jaccard":str(lexical), "trigram_cosine":str(cosine)}
+            route_units = set()
+            if re.search(r"(?i)\b(?:run|execute|invoke|call)\b|运行|执行|调用",text):
+                route_units = {unit.unit_id for unit in manifest.code_units if unit.source_doc_id is None
+                               and pidx.file_by_id.get(unit.file_id,"") in text}
+            route_units.update(unit.unit_id for unit in manifest.code_units
+                               if unit.source_block_id in clause.step_ids)
+            if clause.bound_event_ids:
+                signals["route_disjoint"] = str(event.event_id not in clause.bound_event_ids).lower()
+                signals["exact_event_binding"] = str(event.event_id in clause.bound_event_ids).lower()
+            elif route_units:
+                signals["route_disjoint"] = str(event.unit_id not in reached(route_units)).lower()
+            else:
+                signals["package_wide"] = "true"
+            scored.append((score,clause.clause_id,sources,signals))
+        scored.sort(key=lambda item:(-item[0],item[1]))
+        frontier = scored if max_candidates_per_behavior is None else scored[:max_candidates_per_behavior]
+        for score,clause_id,sources,signals in frontier:
+            result.append(CandidatePair(candidate_id=f"cand-{len(result)+1:04d}",clause_id=clause_id,
+                          behavior_kind=BehaviorKind.EVENT,event_id=event.event_id,
+                          candidate_sources=sources,shared_signals=signals))
+    return result
 
-    capped_hits = _cap_candidates_per_behavior(
-        aggregated_hits,
-        max_candidates_per_behavior=max_candidates_per_behavior,
-    )
-
-    candidates: list[CandidatePair] = []
-    for counter, ((clause_id, _bkind, _obj_id), (bkind, obj_id, sources, signals, route_refs)) in enumerate(
-        capped_hits.items(),
-        start=1,
-    ):
-        cp = CandidatePair(
-            candidate_id=f"cand-{counter:04d}",
-            clause_id=clause_id,
-            behavior_kind=bkind,
-            event_id=obj_id if bkind == BehaviorKind.EVENT else None,
-            resource_id=obj_id if bkind == BehaviorKind.RESOURCE else None,
-            path_id=obj_id if bkind == BehaviorKind.PATH else None,
-            candidate_sources=sources,
-            shared_signals=signals,
-            route_refs=route_refs,
-        )
-        candidates.append(cp)
-
-    logger.info(
-        "Generated %d candidate pairs for %d clauses",
-        len(candidates),
-        len(contract_table.clauses),
-    )
-    return candidates
 
 
 def generate_alignment_candidates(
@@ -604,9 +594,10 @@ def _cap_candidates_per_behavior(
 def _candidate_rank(
     hit: tuple[BehaviorKind, str, list[CandidateSource], dict[str, str], list[str]],
     clause_id: str,
-) -> tuple[int, float, str]:
+) -> tuple[int, int, float, str]:
     _bkind, obj_id, sources, signals, route_refs = hit
     return (
+        0 if signals.get("exact_event_binding") == "true" else 1,
         -_candidate_source_strength(sources, signals, route_refs),
         -float(signals.get("semantic_score", "0") or 0),
         f"{clause_id}:{obj_id}",
@@ -652,6 +643,12 @@ def _deterministic_candidates(
     hits: list[_Hit] = []
     hits.extend(_capability_atom_match(clause, bidx, overlap_map))
     hits.extend(_literal_overlap(clause, bidx))
+    for constraint in clause.constraints:
+        if constraint.constraint_type in CONTROL_TYPES:
+            for resource in bidx.resources_by_value.get(f"{constraint.constraint_type}:{constraint.value}".lower(), []):
+                if resource.resource_type == "control_condition" and resource.event_id:
+                    hits.append((BehaviorKind.EVENT, resource.event_id, [CandidateSource.LITERAL_OVERLAP],
+                                 {"control_condition": resource.value}, []))
     hits.extend(_package_link_provenance(clause, bidx, pidx, overlap_map))
     hits.extend(_path_candidates(clause, bidx, overlap_map, a_req))
     hits.extend(
@@ -994,7 +991,10 @@ def _capability_family_match(
 ) -> bool:
     if clause_capability == behavior_capability:
         return True
-    return behavior_capability in overlap_map.get(clause_capability, set())
+    # Retrieval compares both directions; authorization preserves the direction
+    # of the declared-to-event coverage relation in capability_overlaps.
+    return (behavior_capability in overlap_map.get(clause_capability, set())
+            or clause_capability in overlap_map.get(behavior_capability, set()))
 
 
 def _clause_semantic_tokens(clause: Clause) -> set[str]:
@@ -1052,7 +1052,7 @@ def _semantic_score(left: set[str], right: set[str]) -> tuple[float, set[str], f
     lexical_score = (
         0.0
         if not shared
-        else len(shared) / math.sqrt(len(left) * len(right))
+        else len(shared) / len(left | right)
     )
     embedding_score = _hashed_embedding_cosine(left, right)
     return lexical_score, shared, embedding_score
@@ -1084,8 +1084,8 @@ def _hashed_embedding_cosine(left: set[str], right: set[str]) -> float:
     word tokens plus token character trigrams, which makes near-surface matches
     rank above unrelated text even when exact token overlap is sparse.
     """
-    left_vec = _hashed_embedding(left)
-    right_vec = _hashed_embedding(right)
+    left_vec = _hashed_embedding(frozenset(left))
+    right_vec = _hashed_embedding(frozenset(right))
     if not left_vec or not right_vec:
         return 0.0
     dot = sum(value * right_vec.get(index, 0.0) for index, value in left_vec.items())
@@ -1096,7 +1096,8 @@ def _hashed_embedding_cosine(left: set[str], right: set[str]) -> float:
     return max(0.0, min(1.0, dot / (left_norm * right_norm)))
 
 
-def _hashed_embedding(tokens: set[str]) -> dict[int, float]:
+@lru_cache(maxsize=4096)
+def _hashed_embedding(tokens: frozenset[str]) -> dict[int, float]:
     vector: dict[int, float] = {}
     for feature in _embedding_features(tokens):
         digest = hashlib.blake2b(feature.encode("utf-8"), digest_size=8).digest()
@@ -1106,10 +1107,9 @@ def _hashed_embedding(tokens: set[str]) -> dict[int, float]:
     return vector
 
 
-def _embedding_features(tokens: set[str]) -> list[str]:
+def _embedding_features(tokens: frozenset[str]) -> list[str]:
     features: list[str] = []
     for token in sorted(tokens):
-        features.append(f"tok:{token}")
         padded = f"^{token}$"
         for index in range(max(0, len(padded) - 2)):
             features.append(f"tri:{padded[index:index + 3]}")

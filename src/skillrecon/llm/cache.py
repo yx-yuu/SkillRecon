@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
-DEFAULT_CACHE_ROOT = Path("derived/llm_cache")
+DEFAULT_CACHE_ROOT = Path("outputs/llm-cache")
 
 
 def compute_config_hash(config: LLMConfig, prompt_version: str) -> str:
@@ -88,13 +88,17 @@ class LLMCache:
 class CachedLLMClient:
     """Wrap an LLM client with a disk-backed cache."""
 
-    def __init__(self, client: LLMClient, cache: LLMCache) -> None:
+    def __init__(self, client: LLMClient | None, cache: LLMCache, config: LLMConfig | None = None) -> None:
         self._client = client
         self._cache = cache
+        self._config = config
 
     @property
     def config(self) -> LLMConfig:
         """Return the wrapped LLM configuration."""
+        if self._client is None:
+            assert self._config is not None
+            return self._config
         return self._client.config
 
     @classmethod
@@ -108,9 +112,9 @@ class CachedLLMClient:
         from skillrecon.llm.client import LLMClient
 
         config_hash = compute_config_hash(config, prompt_version)
-        client = LLMClient(config)
-        cache = LLMCache(cache_root, config_hash)
-        return cls(client, cache)
+        client = None if config.cache_only else LLMClient(config)
+        cache = LLMCache(Path(config.cache_root) if config.cache_root else cache_root, config_hash)
+        return cls(client, cache, config)
 
     def complete(
         self,
@@ -123,15 +127,21 @@ class CachedLLMClient:
     ) -> str:
         """Return a cached or freshly generated text completion."""
         cached = self._cache.get(skill_id, call_key)
+        if cached is not None and cached["request"]["messages"] != messages:
+            logger.info("Cache request changed: %s/%s", skill_id, call_key)
+            cached = None
         if cached is not None:
             logger.debug("Cache hit: %s/%s", skill_id, call_key)
             return str(cached["response"])
 
+        if self._client is None:
+            raise FileNotFoundError(f"Offline LLM cache miss: {skill_id}/{call_key}")
         result = self._client.complete(
             messages, temperature=temperature, max_tokens=max_tokens
         )
         self._cache.put(
-            skill_id, call_key, request={"messages": messages}, response=result
+            skill_id, call_key,
+            request={"messages": messages, "response_metadata": self._client.last_response_metadata}, response=result
         )
         return result
 
@@ -147,6 +157,9 @@ class CachedLLMClient:
     ) -> T:
         """Return a cached or freshly generated structured completion."""
         cached = self._cache.get(skill_id, call_key)
+        if cached is not None and cached["request"]["messages"] != messages:
+            logger.info("Cache request changed: %s/%s", skill_id, call_key)
+            cached = None
         if cached is not None:
             logger.debug("Cache hit: %s/%s", skill_id, call_key)
             try:
@@ -160,11 +173,14 @@ class CachedLLMClient:
                 )
                 self._cache.delete(skill_id, call_key)
 
+        if self._client is None:
+            raise FileNotFoundError(f"Offline LLM cache miss: {skill_id}/{call_key}")
         result = self._client.structured_complete(
             messages, response_model, temperature=temperature, max_tokens=max_tokens
         )
         raw = result.model_dump_json()
         self._cache.put(
-            skill_id, call_key, request={"messages": messages}, response=raw
+            skill_id, call_key,
+            request={"messages": messages, "response_metadata": self._client.last_response_metadata}, response=raw
         )
         return result

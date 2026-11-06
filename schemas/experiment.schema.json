@@ -1,0 +1,178 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "gold",
+    "systems"
+  ],
+  "properties": {
+    "gold": {
+      "type": "string"
+    },
+    "main_system": {
+      "type": "string",
+      "default": "skillrecon"
+    },
+    "systems": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "properties": {
+          "artifacts": {
+            "type": "string"
+          },
+          "reports": {
+            "type": "string"
+          },
+          "predictions": {
+            "type": "string"
+          },
+          "system_id": {
+            "type": "string"
+          },
+          "native_types": {
+            "type": "boolean"
+          },
+          "rq1_clauses": {
+            "type": "string"
+          },
+          "rq1_objects": {
+            "type": "string"
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "artifacts"
+            ]
+          },
+          {
+            "required": [
+              "reports"
+            ]
+          },
+          {
+            "required": [
+              "predictions"
+            ]
+          }
+        ]
+      }
+    },
+    "rq1_clauses": {
+      "type": "string"
+    },
+    "rq1_objects": {
+      "type": "string"
+    },
+    "witness_grounding": {
+      "type": "string"
+    },
+    "backbone_systems": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "sensitivity": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "parameter",
+          "value",
+          "system"
+        ],
+        "properties": {
+          "parameter": {
+            "type": "string",
+            "enum": [
+              "n",
+              "theta",
+              "k_c",
+              "witness_bounds"
+            ]
+          },
+          "value": {},
+          "system": {
+            "type": "string"
+          }
+        }
+      }
+    },
+    "robustness": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "name",
+          "gold"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "gold": {
+            "type": "string"
+          },
+          "mechanism_annotations": {
+            "type": "string"
+          },
+          "artifacts": {
+            "type": "string"
+          },
+          "reports": {
+            "type": "string"
+          },
+          "predictions": {
+            "type": "string"
+          },
+          "system_id": {
+            "type": "string"
+          },
+          "native_types": {
+            "type": "boolean"
+          },
+          "rq1_clauses": {
+            "type": "string"
+          },
+          "rq1_objects": {
+            "type": "string"
+          }
+        },
+        "anyOf": [
+          {
+            "required": [
+              "artifacts"
+            ]
+          },
+          {
+            "required": [
+              "reports"
+            ]
+          },
+          {
+            "required": [
+              "predictions"
+            ]
+          }
+        ]
+      }
+    },
+    "error_annotations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "reason"
+        ],
+        "properties": {
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  }
+}

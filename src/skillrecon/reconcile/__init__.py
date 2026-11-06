@@ -17,6 +17,7 @@ from skillrecon.reconcile.predicate import (
     prohibition_conflict,
     resource_compatible,
     scope_satisfied,
+    path_justified,
 )
 
 __all__ = [
@@ -30,6 +31,7 @@ __all__ = [
     "capability_overlaps",
     "resource_compatible",
     "scope_satisfied",
+    "path_justified",
     "prohibition_conflict",
     "execution_route_justified",
 ]

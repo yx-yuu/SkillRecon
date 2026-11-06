@@ -13,6 +13,8 @@
 
 import python
 import semmle.python.Concepts
+import SkillReconFileIO
+import SkillReconExecution
 import semmle.python.dataflow.new.DataFlow
 
 // ---------------------------------------------------------------------------
@@ -34,7 +36,7 @@ predicate isConceptCapability(DataFlow::Node node, string capType, string detail
   // pexpect, paramiko exec_command, fabric, invoke
   exists(SystemCommandExecution cmd |
     node = cmd and
-    capType = "shell_exec" and
+    capType = skillReconExecutionCapability(cmd) and
     detail = "system command execution"
   )
   or
@@ -42,6 +44,8 @@ predicate isConceptCapability(DataFlow::Node node, string capType, string detail
   // FileSystemAccess covers: open, pathlib, anyio, aiofiles, aiofile,
   // lxml, werkzeug, flask, fastapi, sanic, starlette, cherrypy, aiohttp, baize
   (
+    (skillReconWriteOpen(node) and capType = "file_write" and detail = "file system write")
+    or
     exists(FileSystemWriteAccess fsw |
       node = fsw and
       capType = "file_write" and
@@ -49,7 +53,7 @@ predicate isConceptCapability(DataFlow::Node node, string capType, string detail
     )
     or
     exists(FileSystemAccess fsa |
-      not fsa instanceof FileSystemWriteAccess and
+      skillReconReadAccess(fsa) and
       node = fsa and
       capType = "file_read" and
       detail = "file system read"
@@ -87,12 +91,29 @@ predicate isConceptCapability(DataFlow::Node node, string capType, string detail
   // --- Encoding / data send ---
   exists(Encoding enc |
     node = enc and
-    capType = "data_encode_send" and
+    capType = "data_encode" and
     detail = "data encoding (" + enc.getFormat() + ")"
   )
 }
 
-from DataFlow::Node node, string capType, string detail
-where isConceptCapability(node, capType, detail)
+bindingset[capType, resource]
+string resourceFields(string capType, string resource) {
+  capType in ["file_read", "file_write"] and
+  (
+    resource = "<dynamic-path>" and
+    result = " | resourceType=path | resourceValue=" + resource + " | resourceResolved=false"
+    or
+    resource != "<dynamic-path>" and
+    result = " | resourceType=path | resourceValue=" + resource + " | resourceResolved=true"
+  )
+  or
+  not capType in ["file_read", "file_write"] and result = ""
+}
+
+from DataFlow::Node node, string capType, string detail, string resource
+where
+  isConceptCapability(node, capType, detail) and
+  (resource = skillReconFileResource(node) or
+   not exists(skillReconFileResource(node)) and resource = "<dynamic-path>")
 select node,
-  "capType=" + capType + " | detail=" + detail + " | tier=concepts"
+  "capType=" + capType + " | detail=" + detail + " | tier=concepts" + resourceFields(capType, resource)

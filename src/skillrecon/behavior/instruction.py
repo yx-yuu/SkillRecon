@@ -233,7 +233,7 @@ def _infer_line_observations(
     if upload_hint is not None:
         observations.append(
             _make_observation(
-                cap_type="data_upload",
+                cap_type="upload_exfil",
                 detail=upload_hint[1],
                 relative_path=relative_path,
                 line=line,

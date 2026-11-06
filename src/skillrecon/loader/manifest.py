@@ -96,6 +96,16 @@ def build_manifest(
         )
         code_units.extend(synthetic)
         unit_idx += len(synthetic)
+        from skillrecon.loader.platforms import NATIVE_CONFIGS, configuration_hooks
+        if entry.relative_path in NATIVE_CONFIGS:
+            for pointer, command in configuration_hooks(content):
+                code_units.append(CodeUnit(
+                    unit_id=f"config_u{unit_idx}", file_id=entry.file_id, language="bash",
+                    source_doc_id=doc.doc_id, source_block_id=f"config_hook/{unit_idx}",
+                    source_offset=0, source_pointer=pointer,
+                    binding_instruction=f"Execute declared lifecycle hook {pointer}",
+                ))
+                unit_idx += 1
 
     standalone_unit_by_file_id = {
         unit.file_id: unit.unit_id

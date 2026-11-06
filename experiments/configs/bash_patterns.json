@@ -1,21 +1,39 @@
 {
   "version": "v1",
-  "description": "Bash command patterns for Tier 3 conservative extraction. Bash commands are stable identifiers (curl is always curl), so pattern matching is appropriate here unlike Python/JS APIs.",
+  "description": "Tier 3 vocabulary for literal Shell command positions and resource syntax. Operation observations, resource resolution, cross-file routes, and payload-flow traces are recorded separately.",
   "patterns": {
     "http_request": {
-      "commands": ["curl", "wget", "httpie", "http"],
+      "commands": [
+        "curl",
+        "wget",
+        "httpie",
+        "http"
+      ],
       "notes": "HTTP client commands"
     },
     "ssh_connect": {
-      "commands": ["ssh", "scp", "sftp", "rsync"],
+      "commands": [
+        "ssh",
+        "scp",
+        "sftp",
+        "rsync"
+      ],
       "notes": "Remote shell and file transfer"
     },
     "file_delete": {
-      "commands": ["rm", "rmdir", "shred"],
+      "commands": [
+        "rm",
+        "rmdir",
+        "shred"
+      ],
       "notes": "File/directory removal"
     },
     "file_permission_change": {
-      "commands": ["chmod", "chown", "chgrp"],
+      "commands": [
+        "chmod",
+        "chown",
+        "chgrp"
+      ],
       "notes": "Permission and ownership changes"
     },
     "shell_exec": {
@@ -38,32 +56,59 @@
       ],
       "notes": "Shell invocation and script sourcing"
     },
-    "subprocess_spawn": {
-      "commands": ["nohup", "screen", "tmux", "xargs"],
+    "subprocess": {
+      "commands": [
+        "nohup",
+        "screen",
+        "tmux",
+        "xargs"
+      ],
       "notes": "Background/detached process spawning"
     },
     "env_var_read": {
-      "patterns": ["\\$\\{?[A-Z_][A-Z0-9_]*\\}?", "export\\s+", "printenv"],
-      "notes": "Environment variable references and exports"
+      "commands": [
+        "printenv"
+      ],
+      "notes": "Parsed shell expansions with ordered assignments and scope-aware variable provenance; exporting a local value is not an environment input read"
     },
-    "cron_schedule": {
-      "commands": ["crontab", "at", "batch"],
+    "cron_write": {
+      "commands": [
+        "crontab",
+        "at",
+        "batch"
+      ],
       "notes": "Task scheduling"
     },
     "file_write": {
-      "patterns": [">\\s+", ">>\\s+", "tee\\s+"],
+      "patterns": [
+        ">\\s+",
+        ">>\\s+",
+        "tee\\s+"
+      ],
       "notes": "Output redirection and tee"
     },
-    "data_encode_send": {
-      "commands": ["base64", "xxd", "openssl enc"],
+    "data_encode": {
+      "commands": [
+        "base64",
+        "xxd",
+        "openssl enc"
+      ],
       "notes": "Data encoding commands"
     },
-    "dns_lookup": {
-      "commands": ["dig", "nslookup", "host"],
+    "dns_query": {
+      "commands": [
+        "dig",
+        "nslookup",
+        "host"
+      ],
       "notes": "DNS query commands"
     },
     "process_kill": {
-      "commands": ["kill", "killall", "pkill"],
+      "commands": [
+        "kill",
+        "killall",
+        "pkill"
+      ],
       "notes": "Process termination"
     },
     "dynamic_import": {
@@ -85,8 +130,12 @@
       ],
       "notes": "Package installation (runtime dependency injection)"
     },
-    "service_management": {
-      "commands": ["systemctl", "service", "launchctl"],
+    "daemon_spawn": {
+      "commands": [
+        "systemctl",
+        "service",
+        "launchctl"
+      ],
       "notes": "System service management"
     }
   }

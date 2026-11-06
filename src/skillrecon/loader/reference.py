@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import posixpath
 import re
 from pathlib import Path, PurePosixPath
 
@@ -14,7 +16,7 @@ logger = logging.getLogger(__name__)
 _BACKTICK_PATH = re.compile(r"`([^`]+\.\w+)`")
 _MD_LINK = re.compile(r"\[([^\]]*)\]\(([^)]+)\)")
 
-_TEXT_KINDS = {FileKind.MARKDOWN, FileKind.JSON}
+_CONTRACT_SUFFIXES = {".md", ".json", ".yaml", ".yml", ".toml", ".txt", ".ini", ".cfg"}
 
 
 def extract_references(
@@ -60,6 +62,19 @@ def extract_references(
                 )
             )
 
+    from skillrecon.loader.platforms import NATIVE_CONFIGS
+    if source_relative_path in NATIVE_CONFIGS:
+        payload = json.loads(content)
+        targets = [(target, json.dumps(target, ensure_ascii=False))
+                   for target in payload.get('instructions', [])]
+        targets += [(match.group(1), match.group(0))
+                    for match in re.finditer(r'\{file:([^}]+)\}', content)]
+        for target, span in targets:
+            normalized = _normalize_path(target, source_relative_path)
+            if normalized and normalized not in seen_paths and _looks_like_file_path(normalized):
+                seen_paths.add(normalized)
+                refs.append(ReferenceLink(source_doc_id=doc_id, target_path=normalized,
+                    reference_type=ReferenceType.EXPLICIT_LINK, source_span=span))
     return refs
 
 
@@ -71,11 +86,10 @@ def _normalize_path(
     path_str = _strip_link_suffix(raw_path.strip())
     if not path_str:
         return None
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*://", path_str):
+        return None
 
     path_str = path_str.replace("\\", "/")
-
-    if _has_path_traversal(path_str):
-        return None
 
     if len(path_str) > 2 and path_str[1] == ":":
         parts = PurePosixPath(path_str).parts
@@ -92,7 +106,10 @@ def _normalize_path(
         if str(base_dir) != ".":
             path_str = str(base_dir / path_str)
 
-    return str(PurePosixPath(path_str)) if path_str else None
+    normalized = posixpath.normpath(path_str)
+    if normalized.startswith("/") or normalized == ".." or normalized.startswith("../"):
+        return None
+    return normalized
 
 
 def _strip_link_suffix(path_str: str) -> str:
@@ -112,7 +129,7 @@ def _has_path_traversal(path_str: str) -> bool:
 
 
 _KNOWN_EXTENSIONS = {
-    ".md", ".txt", ".json", ".yaml", ".yml", ".toml",
+    ".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".ini", ".cfg",
     ".py", ".js", ".ts", ".mjs", ".sh", ".bash",
     ".html", ".css", ".xml", ".csv",
 }
@@ -139,26 +156,17 @@ def build_document_closure(
     """Build the rooted SKILL.md document closure and its reference edges."""
     file_map: dict[str, FileEntry] = {f.relative_path: f for f in files}
 
-    root_entry = file_map.get("SKILL.md")
-    if root_entry is None:
-        root_candidates = [
-            entry
-            for entry in files
-            if PurePosixPath(entry.relative_path).name.lower() == "skill.md"
-            and PurePosixPath(entry.relative_path).parent == PurePosixPath(".")
-        ]
-        if root_candidates:
-            root_entry = root_candidates[0]
-    if root_entry is None:
-        raise FileNotFoundError("SKILL.md not found in skill package")
+    from skillrecon.loader.platforms import documentary_roots
+    roots = documentary_roots(files)
+    if not roots:
+        raise FileNotFoundError("No SKILL.md, native Claude Code/OpenCode document or permission entry in package")
 
     documents: list[DocumentNode] = []
     references: list[DocumentReference] = []
     visited: set[str] = set()
-    queued: set[str] = {root_entry.relative_path}
-
+    queued: set[str] = {entry.relative_path for entry in roots}
     queue: list[tuple[FileEntry, int, str | None, ReferenceType | None]] = [
-        (root_entry, 0, None, None),
+        (entry, 0, None, None) for entry in roots
     ]
     doc_idx = 0
 
@@ -182,7 +190,7 @@ def build_document_closure(
             )
         )
 
-        if entry.kind not in _TEXT_KINDS:
+        if PurePosixPath(entry.relative_path).suffix.lower() not in _CONTRACT_SUFFIXES:
             continue
 
         file_path = skill_path / entry.relative_path
@@ -199,7 +207,7 @@ def build_document_closure(
 
             if target is None:
                 status = ReferenceResolutionStatus.UNRESOLVED
-            elif target.kind in _TEXT_KINDS:
+            elif PurePosixPath(target.relative_path).suffix.lower() in _CONTRACT_SUFFIXES:
                 status = ReferenceResolutionStatus.ADMITTED
                 if target.relative_path not in visited and target.relative_path not in queued:
                     queue.append((target, depth + 1, doc_id, ref.reference_type))

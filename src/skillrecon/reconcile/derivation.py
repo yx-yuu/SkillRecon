@@ -8,15 +8,18 @@ Builds:
 
 from __future__ import annotations
 
+from skillrecon.contract.controls import CONTROL_TYPES
+
+import json
 import logging
 import re
 from dataclasses import dataclass, field
 
 from skillrecon.contract.normalize import (
     is_resource_constraint,
-    is_scope_constraint,
     looks_typed_constraint_applicable,
 )
+from skillrecon.contract.steps import extract_step_order
 from skillrecon.core.enums import (
     BehaviorKind,
     CandidateSource,
@@ -41,6 +44,7 @@ from skillrecon.core.types import (
     ResourceUse,
     RiskPath,
     Step,
+    StepOrderEdge,
     StepUnitCandidate,
 )
 from skillrecon.reconcile.predicate import (
@@ -51,6 +55,8 @@ from skillrecon.reconcile.predicate import (
     execution_route_justified,
     prohibition_conflict,
     resource_compatible,
+    path_justified,
+    PathJustification as _PathSequenceDecision,
 )
 
 logger = logging.getLogger(__name__)
@@ -64,12 +70,6 @@ class _CandidateContext:
     behavior_capability: str
 
 
-@dataclass(frozen=True)
-class _PathSequenceDecision:
-    result: PredicateResult
-    supporting_judgment_ids: list[str] = field(default_factory=list)
-    abstain_reason: str | None = None
-    notes: str = ""
 
 
 @dataclass
@@ -156,6 +156,7 @@ class _Accumulator:
             edge.event_id,
             edge.path_id,
             edge.resource_id,
+            edge.binding_resource_id,
         )
         if key in self.edge_keys:
             return
@@ -176,6 +177,7 @@ def derive_edges(
     overlap_map: _OverlapMap,
     a_req: set[str] | None = None,
     steps_by_id: dict[str, Step] | None = None,
+    step_order_edges: list[StepOrderEdge] | None = None,
 ) -> list[ReconciliationEdge]:
     """Compatibility wrapper returning only projection edges."""
     return materialize_reconciliation(
@@ -190,6 +192,7 @@ def derive_edges(
         overlap_map=overlap_map,
         a_req=a_req,
         steps_by_id=steps_by_id,
+        step_order_edges=step_order_edges,
     ).edges
 
 
@@ -331,6 +334,7 @@ def materialize_reconciliation(
     overlap_map: _OverlapMap,
     a_req: set[str] | None = None,
     steps_by_id: dict[str, Step] | None = None,
+    step_order_edges: list[StepOrderEdge] | None = None,
 ) -> MaterializationResult:
     """Materialize proof-carrying reconciliation artifacts."""
     acc = _Accumulator()
@@ -338,9 +342,6 @@ def materialize_reconciliation(
     path_candidates: dict[str, CandidatePair] = {}
 
     for cand in candidates:
-        clause = clauses.get(cand.clause_id)
-        if clause is None:
-            continue
         if cand.behavior_kind == BehaviorKind.PATH and cand.path_id:
             path_candidates.setdefault(cand.path_id, cand)
             route_result, route_support = execution_route_justified(
@@ -357,14 +358,30 @@ def materialize_reconciliation(
             )
             continue
 
+        clause = clauses.get(cand.clause_id)
+        if clause is None or clause.role.value != "policy":
+            continue
+
         context = _build_context(
             cand, clause, events, resources_by_event, resources_by_id, paths
         )
-        _materialize_candidate(
-            acc, context, overlap_map, events, paths, bridges, orchestrations
-        )
+        bindings = _resource_bindings(context.resources, context.behavior_capability)
+        for resource_id, binding_resources in bindings:
+            bound_candidate = cand.model_copy(update={"resource_id": resource_id})
+            bound_context = _CandidateContext(candidate=bound_candidate, clause=clause,
+                                               resources=binding_resources, behavior_capability=context.behavior_capability)
+            _materialize_candidate(acc, bound_context, overlap_map, events, paths, bridges, orchestrations)
 
-    _materialize_no_support_certificates(acc, events)
+    for path_id, path in paths.items():
+        if path_id in path_candidates:
+            continue
+        cand = CandidatePair(candidate_id=f"path-{path_id}", clause_id="", behavior_kind=BehaviorKind.PATH, path_id=path_id)
+        path_candidates[path_id] = cand
+        route_result, route_support = execution_route_justified(cand, events, paths, bridges, orchestrations)
+        acc.path_route_judgments[path_id] = acc.add_judgment(JudgmentKind.ROUTE_CHECK, route_result, [path_id],
+            candidate_id=cand.candidate_id, route_support_type=route_support,
+            evidence_refs=[path_id, *path.bridges_used], abstain_reason=_route_abstain_reason(route_result,route_support))
+    _materialize_no_support_certificates(acc, events, resources_by_event, effective_a_req)
     _materialize_path_justifications(
         acc,
         path_candidates,
@@ -375,6 +392,8 @@ def materialize_reconciliation(
         events,
         effective_a_req,
         steps_by_id or {},
+        resources_by_event,
+        step_order_edges,
     )
 
     logger.info(
@@ -407,6 +426,25 @@ def _build_context(
     )
 
 
+def _resource_bindings(resources: list[ResourceUse], capability: str):
+    """Evaluate each operation target independently, retaining its conditions."""
+    types = ({"env_var"} if capability == "env_var_read" else
+             {"path"} if capability.startswith(("file_", "token_file_", "directory_", "temp_file_")) else
+             {"url", "domain", "host"} if capability in {"http_request", "websocket", "ssh_connect", "dns_query", "socket_connect", "upload_exfil", "remote_sync", "telemetry_post"} else
+             {"command"} if capability in {"shell_exec", "subprocess", "eval_exec", "dynamic_import", "cron_write", "daemon_spawn"} else set())
+    primary = [resource for resource in resources if resource.resource_type in types]
+    if any(resource.resource_type == "url" for resource in primary):
+        primary = [resource for resource in primary if resource.resource_type == "url"]
+    if not primary:
+        return [(None, resources)]
+    bindings = []
+    for target in primary:
+        auxiliary = [resource for resource in resources if resource.resource_type not in types
+                     and (not resource.context or not target.context or resource.context == target.context)]
+        bindings.append((target.resource_id, [target, *auxiliary]))
+    return bindings
+
+
 def _materialize_candidate(
     acc: _Accumulator,
     context: _CandidateContext,
@@ -419,7 +457,8 @@ def _materialize_candidate(
     cand = context.candidate
     clause = context.clause
     obj_id = cand.event_id or cand.resource_id or ""
-    evidence_refs = _candidate_evidence_refs(cand, bridges, orchestrations)
+    evidence_refs = list(dict.fromkeys([*_candidate_evidence_refs(cand, bridges, orchestrations),
+                                        *([cand.resource_id] if cand.resource_id else [])]))
 
     cap_judgment = acc.add_judgment(
         JudgmentKind.CAPABILITY_OVERLAP,
@@ -474,6 +513,7 @@ def _materialize_candidate(
             route_judgment.result,
             resource_judgment.result if resource_judgment else None,
         ),
+        binding_resource_id=cand.resource_id,
     )
 
     if clause.operator == ClauseOperator.PROHIBITED and cand.event_id:
@@ -483,11 +523,17 @@ def _materialize_candidate(
             context.resources,
             overlap_map,
         )
+        if route_result == PredicateResult.FALSE:
+            prohib_result = PredicateResult.FALSE
+        elif route_result == PredicateResult.ABSTAIN and prohib_result == PredicateResult.TRUE:
+            prohib_result = PredicateResult.ABSTAIN
         prohibition_judgment = acc.add_judgment(
             JudgmentKind.PROHIBITION_CHECK,
             prohib_result,
             [clause.clause_id, cand.event_id],
-            premise_judgment_ids=[cap_judgment.judgment_id, route_judgment.judgment_id],
+            premise_judgment_ids=[cap_judgment.judgment_id, route_judgment.judgment_id,
+                                  *([j.judgment_id for j in scope_judgments]
+                                    if any(c.constraint_type in CONTROL_TYPES for c in clause.constraints) else [])],
             candidate_id=cand.candidate_id,
             evidence_refs=evidence_refs,
             route_support_type=route_support,
@@ -495,7 +541,7 @@ def _materialize_candidate(
         if prohibition_judgment.result == PredicateResult.TRUE:
             acc.add_certificate(
                 CertificateKind.BLOCKING_PROHIBITION,
-                [clause.clause_id, cand.event_id],
+                [clause.clause_id, cand.event_id, *([cand.resource_id] if cand.resource_id else [])],
                 supporting_judgment_ids=[prohibition_judgment.judgment_id],
                 evidence_refs=evidence_refs,
             )
@@ -505,6 +551,8 @@ def _materialize_candidate(
                     relation=RelationKind.CONTRADICTS,
                     clause_id=clause.clause_id,
                     event_id=cand.event_id,
+                    resource_id=cand.resource_id,
+                    binding_resource_id=cand.resource_id,
                     source_judgment_ids=[prohibition_judgment.judgment_id],
                     candidate_sources=list(cand.candidate_sources),
                     route_support_type=route_support,
@@ -515,7 +563,7 @@ def _materialize_candidate(
                 )
             )
 
-    if clause.operator == ClauseOperator.ALLOWED and cand.event_id:
+    if clause.operator in {ClauseOperator.ALLOWED, ClauseOperator.UNKNOWN} and cand.event_id:
         authorization = _derive_authorization_result(
             clause,
             cap_judgment.result,
@@ -554,7 +602,14 @@ def _materialize_candidate(
             route_support_type=route_support,
             abstain_reason=auth_abstain_reason,
         )
-        acc.auth_results_by_event.setdefault(cand.event_id, []).append(auth_judgment)
+        # A retrieved UNKNOWN clause is not an applicable authorization merely
+        # because its capability family matches. Keep its diagnostic judgment,
+        # but require a concrete clause/behavior anchor before its uncertainty
+        # can suspend this event's NoSupport decision.
+        if clause.operator == ClauseOperator.ALLOWED or _has_strong_candidate_anchor(
+            cand.candidate_sources, route_support
+        ):
+            acc.auth_results_by_event.setdefault(cand.event_id, []).append(auth_judgment)
         if auth_judgment.result == PredicateResult.TRUE:
             acc.add_edge(
                 ReconciliationEdge(
@@ -562,6 +617,8 @@ def _materialize_candidate(
                     relation=RelationKind.SUPPORTS,
                     clause_id=clause.clause_id,
                     event_id=cand.event_id,
+                    resource_id=cand.resource_id,
+                    binding_resource_id=cand.resource_id,
                     source_judgment_ids=[auth_judgment.judgment_id],
                     candidate_sources=list(cand.candidate_sources),
                     route_support_type=route_support,
@@ -571,13 +628,17 @@ def _materialize_candidate(
                     ),
                 )
             )
-        elif auth_judgment.result == PredicateResult.ABSTAIN and _eligible_for_potential_support(
-            cap_judgment.result,
-            route_judgment.result,
-            resource_judgment.result if resource_judgment else None,
-            scope_judgments,
-            cand.candidate_sources,
-            route_support,
+        elif (
+            clause.operator == ClauseOperator.ALLOWED
+            and auth_judgment.result == PredicateResult.ABSTAIN
+            and _eligible_for_potential_support(
+                cap_judgment.result,
+                route_judgment.result,
+                resource_judgment.result if resource_judgment else None,
+                scope_judgments,
+                cand.candidate_sources,
+                route_support,
+            )
         ):
             acc.add_edge(
                 ReconciliationEdge(
@@ -585,6 +646,8 @@ def _materialize_candidate(
                     relation=RelationKind.POTENTIALLY_SUPPORTS,
                     clause_id=clause.clause_id,
                     event_id=cand.event_id,
+                    resource_id=cand.resource_id,
+                    binding_resource_id=cand.resource_id,
                     predicate_satisfied=False,
                     source_judgment_ids=[auth_judgment.judgment_id],
                     candidate_sources=list(cand.candidate_sources),
@@ -637,10 +700,13 @@ def _materialize_scope_checks(
     bridges: dict[str, Bridge],
     orchestrations: dict[str, OrchestrationHypothesis],
     allow_scope_violation: bool,
+    binding_resource_id: str | None = None,
 ) -> list[ReconciliationJudgment]:
     judgments: list[ReconciliationJudgment] = []
     for constraint in clause.constraints:
-        if looks_typed_constraint_applicable(constraint) and is_scope_constraint(constraint):
+        if constraint.constraint_type in {"source_class","sink_domain","separate_invocation"}:
+            continue  # Definition B.4 checks these joint endpoint obligations.
+        if looks_typed_constraint_applicable(constraint):
             relevant_resources = [
                 resource
                 for resource in resources
@@ -648,6 +714,23 @@ def _materialize_scope_checks(
             ]
         else:
             relevant_resources = []
+        if not relevant_resources:
+            judgments.append(
+                acc.add_judgment(
+                    JudgmentKind.SCOPE_CHECK,
+                    PredicateResult.ABSTAIN,
+                    [constraint.constraint_id, *([event_id] if event_id else [])],
+                    candidate_id=candidate_id,
+                    evidence_refs=evidence_refs,
+                    route_support_type=route_support,
+                    abstain_reason=(
+                        "uninterpreted_scope"
+                        if not looks_typed_constraint_applicable(constraint)
+                        else "missing_scope_resource"
+                    ),
+                )
+            )
+            continue
         for resource in relevant_resources:
             result = (
                 PredicateResult.ABSTAIN
@@ -685,18 +768,15 @@ def _materialize_scope_checks(
             elif result == PredicateResult.FALSE and allow_scope_violation:
                 if event_id is not None:
                     acc.scope_failure_events.add(event_id)
-                acc.add_certificate(
-                    CertificateKind.SCOPE_FAILURE,
-                    [constraint.constraint_id, resource.resource_id],
-                    supporting_judgment_ids=[judgment.judgment_id],
-                    evidence_refs=[*evidence_refs, resource.resource_id],
-                )
                 acc.add_edge(
                     ReconciliationEdge(
                         edge_id="pending",
                         relation=RelationKind.SCOPE_VIOLATES,
                         constraint_id=constraint.constraint_id,
-                        resource_id=resource.resource_id,
+                        resource_id=binding_resource_id or resource.resource_id,
+                        clause_id=clause.clause_id,
+                        event_id=event_id,
+                        binding_resource_id=binding_resource_id,
                         source_judgment_ids=[judgment.judgment_id],
                         candidate_sources=list(candidate_sources),
                         route_support_type=route_support,
@@ -723,7 +803,7 @@ def _eligible_for_scope_violation(
         return False
     if cap_result != PredicateResult.TRUE or route_result != PredicateResult.TRUE:
         return False
-    if clause.target:
+    if clause.target or any(is_resource_constraint(constraint) for constraint in clause.constraints):
         return resource_result == PredicateResult.TRUE
     return True
 
@@ -745,11 +825,7 @@ def _eligible_for_potential_support(
         return False
     if any(judgment.result == PredicateResult.FALSE for judgment in scope_judgments):
         return False
-    if _has_strong_candidate_anchor(candidate_sources, route_support):
-        return True
-    if resource_result == PredicateResult.TRUE:
-        return True
-    return any(judgment.result == PredicateResult.TRUE for judgment in scope_judgments)
+    return True
 
 
 def _eligible_for_related_edge(
@@ -794,40 +870,18 @@ def _derive_authorization_result(
     resource_result: PredicateResult | None,
     scope_judgments: list[ReconciliationJudgment],
 ) -> PredicateResult:
-    if cap_result != PredicateResult.TRUE:
-        return cap_result
-    if route_result != PredicateResult.TRUE:
-        return route_result
-
-    if clause.target:
-        if resource_result is None:
-            return PredicateResult.ABSTAIN
-        if resource_result != PredicateResult.TRUE:
-            return resource_result
-
-    resource_constraints = [
-        constraint for constraint in clause.constraints if is_resource_constraint(constraint)
-    ]
-    if resource_constraints:
-        if resource_result is None:
-            return PredicateResult.ABSTAIN
-        if resource_result != PredicateResult.TRUE:
-            return resource_result
-
-    effective_constraints = [
-        constraint
-        for constraint in clause.constraints
-        if is_scope_constraint(constraint)
-    ]
-    if effective_constraints:
-        if not scope_judgments:
-            return PredicateResult.ABSTAIN
-        if any(judgment.result == PredicateResult.FALSE for judgment in scope_judgments):
-            return PredicateResult.FALSE
-        if any(judgment.result == PredicateResult.ABSTAIN for judgment in scope_judgments):
-            return PredicateResult.ABSTAIN
-
+    premises = [cap_result, route_result, *[judgment.result for judgment in scope_judgments]]
+    if clause.target or any(is_resource_constraint(c) for c in clause.constraints):
+        premises.append(resource_result if resource_result is not None else PredicateResult.ABSTAIN)
+    local_constraints = [c for c in clause.constraints if c.constraint_type not in {"source_class","sink_domain","separate_invocation"}]
+    if local_constraints and not scope_judgments:
+        premises.append(PredicateResult.ABSTAIN)
+    if PredicateResult.FALSE in premises:
+        return PredicateResult.FALSE
+    if PredicateResult.ABSTAIN in premises or clause.operator == ClauseOperator.UNKNOWN:
+        return PredicateResult.ABSTAIN
     return PredicateResult.TRUE
+
 
 
 def _authorization_abstain_reason(
@@ -847,16 +901,13 @@ def _authorization_abstain_reason(
         not clause.target and resource_result == PredicateResult.ABSTAIN
     ):
         return "resource_compatibility_abstained"
-    effective_constraints = [
-        constraint
-        for constraint in clause.constraints
-        if is_scope_constraint(constraint)
-    ]
-    if effective_constraints and (
+    if any(c.constraint_type not in {"source_class", "sink_domain", "separate_invocation"} for c in clause.constraints) and (
         not scope_judgments
         or any(judgment.result == PredicateResult.ABSTAIN for judgment in scope_judgments)
     ):
         return "scope_check_abstained"
+    if clause.operator == ClauseOperator.UNKNOWN:
+        return "unknown_clause_operator"
     return None
 
 
@@ -878,41 +929,40 @@ def _alignment_guard_abstain_reason(
 def _materialize_no_support_certificates(
     acc: _Accumulator,
     events: dict[str, CapabilityEvent],
+    resources_by_event: dict[str, list[ResourceUse]],
+    a_req: set[str],
 ) -> None:
-    grouped_events: dict[
-        tuple[str, str, str, str, str],
-        list[tuple[str, CapabilityEvent]],
-    ] = {}
+    """Resolve certificate precedence over the whole frontier of each binding."""
     for event_id, event in events.items():
         if event.tier == "instruction":
             continue
-        if event_id in acc.scope_failure_events:
-            continue
-        auth_judgments = acc.auth_results_by_event.get(event_id, [])
-        results = {judgment.result for judgment in auth_judgments}
-        if PredicateResult.TRUE in results:
-            continue
-        if PredicateResult.ABSTAIN in results:
-            continue
-        if not auth_judgments or PredicateResult.FALSE in results:
-            grouped_events.setdefault(_no_support_signature(event), []).append((event_id, event))
+        for resource_id, binding_resources in _resource_bindings(resources_by_event.get(event_id,[]),event.capability):
+            edges = [edge for edge in acc.edges if edge.event_id == event_id
+                     and edge.binding_resource_id == resource_id]
+            if any(edge.relation == RelationKind.CONTRADICTS for edge in edges):
+                continue
+            if any(edge.relation in {RelationKind.SUPPORTS,RelationKind.POTENTIALLY_SUPPORTS} for edge in edges):
+                continue
+            frontier = [judgment for judgment in acc.auth_results_by_event.get(event_id,[])
+                        if resource_id is None or resource_id in judgment.evidence_refs]
+            failures = [edge for edge in edges if edge.relation == RelationKind.SCOPE_VIOLATES]
+            if failures:
+                for edge in failures:
+                    acc.add_certificate(CertificateKind.SCOPE_FAILURE,
+                        [edge.constraint_id,edge.resource_id],
+                        supporting_judgment_ids=list(dict.fromkeys([*edge.source_judgment_ids,
+                            *[judgment.judgment_id for judgment in frontier]])),
+                        evidence_refs=list(dict.fromkeys([event_id,*[r.resource_id for r in binding_resources]])),
+                        notes="frontier_scope_failure")
+                continue
+            if not event_requires_authorization(event,a_req):
+                continue
+            acc.add_certificate(CertificateKind.NO_SUPPORT,
+                [event_id,*([resource_id] if resource_id else [])],
+                supporting_judgment_ids=[judgment.judgment_id for judgment in frontier],
+                evidence_refs=[event_id,*[r.resource_id for r in binding_resources]],
+                notes="no_positive_potential_scope_or_prohibition_in_retrieved_frontier")
 
-    for grouped in grouped_events.values():
-        subject_refs = [event_id for event_id, _ in grouped]
-        supporting_judgment_ids = sorted(
-            {
-                judgment.judgment_id
-                for event_id, _ in grouped
-                for judgment in acc.auth_results_by_event.get(event_id, [])
-            }
-        )
-        acc.add_certificate(
-            CertificateKind.NO_SUPPORT,
-            subject_refs,
-            supporting_judgment_ids=supporting_judgment_ids,
-            evidence_refs=subject_refs,
-            notes="no_stable_authorization_support",
-        )
 
 
 def _materialize_path_justifications(
@@ -925,6 +975,8 @@ def _materialize_path_justifications(
     events: dict[str, CapabilityEvent],
     a_req: set[str],
     steps_by_id: dict[str, Step],
+    resources_by_event: dict[str, list[ResourceUse]],
+    step_order_edges: list[StepOrderEdge] | None = None,
 ) -> None:
     for path_id, cand in path_candidates.items():
         path = paths.get(path_id)
@@ -943,17 +995,46 @@ def _materialize_path_justifications(
             if (event := events.get(event_id)) is not None
             and event_requires_authorization(event, a_req)
         ]
+        path_edges=list(acc.edges)
+        path_auth=dict(acc.auth_results_by_event)
+        path_resources=dict(resources_by_event)
+        ambiguous_bindings=[]
+        for event_id in required_event_ids:
+            bindings=_resource_bindings(resources_by_event.get(event_id,[]),events[event_id].capability)
+            specified={ref for segment in [path.source,path.sink,*path.segments]
+                       if segment.event_id==event_id for ref in segment.resource_ids}
+            available={identifier for identifier,_ in bindings if identifier is not None}
+            if specified:
+                if not specified<=available:
+                    ambiguous_bindings.append(event_id)
+                    continue
+                bindings=[(identifier,values) for identifier,values in bindings if identifier in specified]
+                path_edges=[edge for edge in path_edges if edge.event_id!=event_id or
+                            edge.binding_resource_id in specified]
+                path_auth[event_id]=[judgment for judgment in path_auth.get(event_id,[])
+                                    if specified.intersection(judgment.subject_refs)]
+                path_resources[event_id]=list({r.resource_id:r for _,values in bindings for r in values}.values())
+            elif len({(values[0].value,values[0].resolved,values[0].context)
+                      for identifier,values in bindings if identifier is not None})>1 and any(
+                          edge.event_id==event_id and edge.relation in {
+                              RelationKind.SUPPORTS,RelationKind.POTENTIALLY_SUPPORTS} for edge in acc.edges):
+                # An authorization on a different branch must not authorize the
+                # resource used by this path. Retain uncertainty until recovery
+                # supplies an operand/resource binding for the path segment.
+                ambiguous_bindings.append(event_id)
 
         result = PredicateResult.TRUE
         abstain_reason: str | None = None
         notes = ""
+        sequence_evidence_refs: list[str] = []
         premise_judgment_ids = [route_judgment.judgment_id]
         if route_judgment.result == PredicateResult.ABSTAIN:
             result = PredicateResult.ABSTAIN
             abstain_reason = route_judgment.abstain_reason or "route_check_abstained"
         elif route_judgment.result == PredicateResult.FALSE:
-            result = PredicateResult.FALSE
-        elif not path_event_ids:
+            result = PredicateResult.ABSTAIN
+            abstain_reason = "unverified_path_route"
+        elif len(path_event_ids) < 2:
             result = PredicateResult.ABSTAIN
             abstain_reason = "missing_path_event_ids"
         elif not required_event_ids:
@@ -961,8 +1042,8 @@ def _materialize_path_justifications(
             abstain_reason = "open_world_path_only"
         else:
             blocking_clause_id, blocking_event_id, blocking_judgment_ids = _path_blocking_prohibition(
-                path_event_ids=path_event_ids,
-                projection_edges=acc.edges,
+                path_event_ids=[event_id for event_id in path_event_ids if event_id not in ambiguous_bindings],
+                projection_edges=path_edges,
             )
             if blocking_clause_id is not None and blocking_event_id is not None:
                 result = PredicateResult.FALSE
@@ -971,7 +1052,7 @@ def _materialize_path_justifications(
             else:
                 segment_statuses, segment_judgment_ids = _path_segment_support_profile(
                     required_event_ids=required_event_ids,
-                    projection_edges=acc.edges,
+                    projection_edges=path_edges,
                 )
                 missing_events = [
                     event_id
@@ -990,20 +1071,27 @@ def _materialize_path_justifications(
                         notes = f"missing_support:{missing_events[0]}"
                     else:
                         notes = "missing_support:" + ",".join(missing_events)
+                elif ambiguous_bindings:
+                    result = PredicateResult.ABSTAIN
+                    abstain_reason = "unresolved_path_resource_binding"
+                    notes = "unresolved_path_resource_binding:" + ",".join(ambiguous_bindings)
                 elif partial_events:
                     result = PredicateResult.ABSTAIN
                     abstain_reason = "partial_path_coverage"
                     notes = "partial_path_coverage:" + ",".join(partial_events)
                 else:
-                    sequence_decision = _search_clause_sequence_for_path(
+                    sequence_decision = path_justified(
                         required_event_ids=required_event_ids,
-                        auth_results_by_event=acc.auth_results_by_event,
+                        auth_results_by_event=path_auth,
                         clauses=clauses,
                         steps_by_id=steps_by_id,
+                        step_order_edges=step_order_edges,
+                        path=path, events=events, resources_by_event=path_resources,
                     )
                     result = sequence_decision.result
                     abstain_reason = sequence_decision.abstain_reason
                     notes = sequence_decision.notes
+                    sequence_evidence_refs = sequence_decision.evidence_refs
                     premise_judgment_ids.extend(sequence_decision.supporting_judgment_ids)
 
         judgment = acc.add_judgment(
@@ -1016,6 +1104,7 @@ def _materialize_path_justifications(
                 path_id,
                 *path.bridges_used,
                 *path.orchestration_hypotheses,
+                *sequence_evidence_refs,
             ],
             route_support_type=route_judgment.route_support_type,
             abstain_reason=abstain_reason,
@@ -1069,7 +1158,7 @@ def _path_segment_support_profile(
             supporting_judgment_ids.update(edge.source_judgment_ids)
             continue
         if (
-            edge.relation in {RelationKind.POTENTIALLY_SUPPORTS, RelationKind.RELATES_TO}
+            edge.relation == RelationKind.POTENTIALLY_SUPPORTS
             and statuses[edge.event_id] != "strong"
         ):
             statuses[edge.event_id] = "partial"
@@ -1077,94 +1166,6 @@ def _path_segment_support_profile(
     return statuses, sorted(supporting_judgment_ids)
 
 
-def _search_clause_sequence_for_path(
-    *,
-    required_event_ids: list[str],
-    auth_results_by_event: dict[str, list[ReconciliationJudgment]],
-    clauses: dict[str, Clause],
-    steps_by_id: dict[str, Step],
-) -> _PathSequenceDecision:
-    option_sets: list[list[tuple[str, str, list[tuple[str, int]]]]] = []
-    for event_id in required_event_ids:
-        options: list[tuple[str, str, list[tuple[str, int]]]] = []
-        for judgment in auth_results_by_event.get(event_id, []):
-            if judgment.result != PredicateResult.TRUE:
-                continue
-            clause_id = next((ref for ref in judgment.subject_refs if ref in clauses), None)
-            if clause_id is None:
-                continue
-            options.append(
-                (
-                    clause_id,
-                    judgment.judgment_id,
-                    _clause_step_orders(clauses[clause_id], steps_by_id),
-                )
-            )
-        if not options:
-            return _PathSequenceDecision(
-                result=PredicateResult.FALSE,
-                notes=f"missing_support:{event_id}",
-            )
-        option_sets.append(options)
-
-    frontier_note = "clause_order_incompatible"
-    saw_missing_order = False
-    saw_incomparable_order = False
-
-    def search(
-        index: int,
-        previous_pos: tuple[str, int] | None,
-        chosen_judgment_ids: list[str],
-    ) -> list[str] | None:
-        nonlocal frontier_note, saw_missing_order, saw_incomparable_order
-        if index >= len(option_sets):
-            return chosen_judgment_ids
-
-        current_event_id = required_event_ids[index]
-        previous_event_id = required_event_ids[index - 1] if index > 0 else None
-
-        for clause_id, judgment_id, positions in option_sets[index]:
-            if not positions:
-                saw_missing_order = True
-                frontier_note = f"missing_clause_step_order:{current_event_id}"
-                continue
-            for pos in positions:
-                if previous_pos is None:
-                    result = search(index + 1, pos, [*chosen_judgment_ids, judgment_id])
-                    if result is not None:
-                        return result
-                    continue
-                if pos[0] != previous_pos[0]:
-                    saw_incomparable_order = True
-                    frontier_note = (
-                        f"incomparable_clause_order:{previous_event_id}->{current_event_id}"
-                    )
-                    continue
-                if pos[1] < previous_pos[1]:
-                    frontier_note = f"order_conflict:{previous_event_id}->{current_event_id}"
-                    continue
-                result = search(index + 1, pos, [*chosen_judgment_ids, judgment_id])
-                if result is not None:
-                    return result
-        return None
-
-    supporting_judgment_ids = search(0, None, [])
-    if supporting_judgment_ids is not None:
-        return _PathSequenceDecision(
-            result=PredicateResult.TRUE,
-            supporting_judgment_ids=supporting_judgment_ids,
-            notes="ordered_clause_sequence_found",
-        )
-    if saw_missing_order or saw_incomparable_order:
-        return _PathSequenceDecision(
-            result=PredicateResult.ABSTAIN,
-            abstain_reason="missing_clause_step_order",
-            notes=frontier_note,
-        )
-    return _PathSequenceDecision(
-        result=PredicateResult.FALSE,
-        notes=frontier_note,
-    )
 
 
 def _get_behavior_capability(

@@ -10,6 +10,7 @@
  */
 
 import javascript
+import SkillReconExecution
 import semmle.javascript.frameworks.WebSocket
 
 // ---------------------------------------------------------------------------
@@ -38,7 +39,7 @@ predicate isConceptCapability(DataFlow::Node node, string capType, string detail
   // execa, shelljs, cross-spawn, ssh2, etc. (10+ libs)
   exists(SystemCommandExecution cmd |
     node = cmd and
-    capType = "shell_exec" and
+    capType = skillReconExecutionCapability(cmd) and
     detail = "system command execution"
   )
   or
@@ -71,7 +72,7 @@ predicate isConceptCapability(DataFlow::Node node, string capType, string detail
   // --- Crypto ---
   exists(Cryptography::CryptographicOperation crypto |
     node = crypto and
-    capType = "data_encode_send" and
+    capType = "data_encode" and
     detail = "cryptographic operation"
   )
 }

@@ -1,0 +1,10 @@
+{
+  "gold": "../../annotations/main.jsonl",
+  "main_system": "skillrecon",
+  "systems": {
+    "skillrecon": {
+      "artifacts": "../../outputs/skillrecon",
+      "native_types": true
+    }
+  }
+}

@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import json
 import logging
+import time
 from pathlib import Path
 
 from skillrecon.contract.classify import classify_clause_roles
-from skillrecon.contract.deterministic import extract_from_frontmatter
+from skillrecon.contract.requirements import preserve_command_conditions, ground_policy_conditions
+from skillrecon.contract.deterministic import extract_from_frontmatter, extract_table_clauses
 from skillrecon.contract.iccm import ICCMExtractor, _load_taxonomy_atoms
 from skillrecon.contract.parser import (
     parse_document,
@@ -30,6 +32,7 @@ from skillrecon.contract.voting import (
     locate_evidence_span,
 )
 from skillrecon.core.config import AnalyzerConfig
+from skillrecon.reconcile.predicate import load_overlap_policy
 from skillrecon.core.enums import ClauseOperator
 from skillrecon.core.sensitivity import event_requires_authorization
 from skillrecon.core.types import (
@@ -70,10 +73,12 @@ class ContractObservationPipeline:
         self._output_dir = output_dir
         self._taxonomy_path = analyzer_config.taxonomy_path
         self._a_req = _load_a_req(self._taxonomy_path)
+        self.inference_seconds = 0.0
 
     def run(self, skill_id: str) -> ContractTable:
         """Run contract observation for one skill package."""
         skill_path = self._data_root / skill_id
+        self.inference_seconds = 0.0
         artifact_dir = self._output_dir / skill_id
         artifact_dir.mkdir(parents=True, exist_ok=True)
 
@@ -108,18 +113,29 @@ class ContractObservationPipeline:
 
             doc_contents[doc.doc_id] = content
             blocks = parse_document(doc.doc_id, content)
+            from skillrecon.loader.platforms import NATIVE_CONFIGS
+            if entry.relative_path in NATIVE_CONFIGS:
+                blocks = [DocBlock(block_id=f"{doc.doc_id}_b0",doc_id=doc.doc_id,
+                    block_type="frontmatter",content=content,source_text=content,
+                    start_offset=0,end_offset=len(content),start_byte=0,end_byte=len(content.encode('utf-8')))]
             all_blocks.extend(blocks)
             steps, step_edges = build_steps(blocks)
+            steps = [step.model_copy(update={"document_path": entry.relative_path}) for step in steps]
             all_steps.extend(steps)
             all_step_edges.extend(step_edges)
 
-            if doc.depth == 0:
-                fm_text, _ = parse_yaml_frontmatter(content)
-                if fm_text:
-                    fields = parse_frontmatter_fields(fm_text)
-                    det_clauses = extract_from_frontmatter(fields, doc.doc_id, fm_text)
-                    deterministic_clauses.extend(det_clauses)
+            fm_text, _ = parse_yaml_frontmatter(content)
+            if fm_text:
+                fields = parse_frontmatter_fields(fm_text)
+                deterministic_clauses.extend(extract_from_frontmatter(fields, doc.doc_id, content))
+            deterministic_clauses.extend(extract_table_clauses(doc.doc_id, blocks))
+            from skillrecon.contract.deterministic import extract_configuration_clauses
+            deterministic_clauses.extend(extract_configuration_clauses(doc.doc_id,entry.relative_path,content))
 
+        from skillrecon.contract.steps import extract_step_order
+        semantic_edges, unresolved_order = extract_step_order(all_steps)
+        all_steps = [step.model_copy(update={"unresolved_order":step.step_id in unresolved_order}) for step in all_steps]
+        all_step_edges = [edge for edge in all_step_edges if edge.relation == "document_precedes"] + semantic_edges
         doc_pack = DocumentPack(
             skill_id=skill_id,
             admitted_docs=list(manifest.documents),
@@ -164,18 +180,16 @@ class ContractObservationPipeline:
 
         from skillrecon.llm.cache import CachedLLMClient
 
-        client = CachedLLMClient.from_config(
-            self._config.llm,
-            self._config.prompt_version,
-        )
-        extractor = ICCMExtractor(
-            client,
-            taxonomy_atoms=_load_taxonomy_atoms(str(self._taxonomy_path)),
-            prompt_version=self._config.prompt_version,
-        )
         n_samples = self._config.vote_policy.n_samples
-
-        all_samples = extractor.extract_all(skill_id, llm_steps, n_samples)
+        if llm_steps:
+            client = CachedLLMClient.from_config(self._config.llm,self._config.prompt_version)
+            extractor = ICCMExtractor(client,taxonomy_atoms=_load_taxonomy_atoms(str(self._taxonomy_path)),
+                                      prompt_version=self._config.prompt_version)
+            inference_started = time.perf_counter()
+            all_samples = extractor.extract_all(skill_id, llm_steps, n_samples)
+            self.inference_seconds += time.perf_counter() - inference_started
+        else:
+            all_samples = [[] for _ in range(n_samples)]
         raw_samples_data = [[s.model_dump() for s in sl] for sl in all_samples]
         self._save_artifact(artifact_dir / "raw_clause_samples.json", raw_samples_data)
 
@@ -185,16 +199,21 @@ class ContractObservationPipeline:
             n_samples=n_samples,
             agreement_threshold=self._config.vote_policy.agreement_threshold,
         )
+        self._save_artifact(artifact_dir / "raw_canonical_clauses.json", [c.model_dump() for c in llm_clauses])
 
-        logger.info("[%s] Step 5: Authorization guard...", skill_id)
-        guarded_llm_clauses = apply_authorization_guard(llm_clauses, self._a_req)
+        logger.info("[%s] Step 5: Evidence grounding and role assignment...", skill_id)
+        grounded_llm_clauses = _ground_evidence(llm_clauses, doc_contents, all_steps)
+        classified_llm_clauses = classify_clause_roles(grounded_llm_clauses, manifest, all_steps)
+        self._save_artifact(artifact_dir / "grounded_clauses.json", [c.model_dump() for c in grounded_llm_clauses])
+        self._save_artifact(artifact_dir / "classified_clauses.json", [c.model_dump() for c in classified_llm_clauses])
 
-        logger.info("[%s] Step 6: Evidence grounding...", skill_id)
-        grounded_llm_clauses = _ground_evidence(guarded_llm_clauses, doc_contents)
+        logger.info("[%s] Step 6: Authorization guard...", skill_id)
+        guarded_llm_clauses = apply_authorization_guard(classified_llm_clauses, self._a_req)
+        self._save_artifact(artifact_dir / "guarded_clauses.json", [c.model_dump() for c in guarded_llm_clauses])
 
         logger.info("[%s] Step 7: Merging deterministic + LLM clauses...", skill_id)
-        all_clauses = deterministic_clauses + grounded_llm_clauses
-        all_clauses = classify_clause_roles(all_clauses, manifest)
+        self._save_artifact(artifact_dir / "deterministic_clauses.json", [c.model_dump() for c in deterministic_clauses])
+        all_clauses = preserve_command_conditions(ground_policy_conditions(deterministic_clauses + guarded_llm_clauses,doc_contents))
         conflicts = detect_clause_conflicts(all_clauses)
 
         self._save_artifact(
@@ -232,7 +251,7 @@ class ContractObservationPipeline:
             skill_id,
             len(contract_table.clauses),
             len(deterministic_clauses),
-            len(grounded_llm_clauses),
+            len(guarded_llm_clauses),
         )
         return contract_table
 
@@ -270,6 +289,7 @@ class ContractObservationPipeline:
             resources=resources,
             clauses=contract_table.clauses,
             a_req=set(self._a_req),
+            overlap_map=load_overlap_policy(Path(self._config.reconciliation_policy.overlap_policy_path)),
         )
         existing_steps = contract_table.steps or build_steps(document_pack.doc_blocks)[0]
         selected_steps = select_recall_steps(
@@ -307,6 +327,7 @@ class ContractObservationPipeline:
             taxonomy_atoms=_load_taxonomy_atoms(str(self._taxonomy_path)),
             prompt_version=self._config.prompt_version,
         )
+        inference_started = time.perf_counter()
         recall_samples = extractor.extract_recall_all(
             skill_id,
             selected_steps,
@@ -314,6 +335,7 @@ class ContractObservationPipeline:
             self._config.vote_policy.n_samples,
             call_key_prefix="iccm_recall",
         )
+        self.inference_seconds += time.perf_counter() - inference_started
         self._save_artifact(
             artifact_dir / "recall_raw_clause_samples.json",
             [[sample.model_dump() for sample in group] for group in recall_samples],
@@ -324,34 +346,28 @@ class ContractObservationPipeline:
             n_samples=self._config.vote_policy.n_samples,
             agreement_threshold=self._config.vote_policy.agreement_threshold,
         )
-        recall_clauses = apply_authorization_guard(recall_clauses, self._a_req)
         doc_contents = _load_doc_contents(skill_path, manifest)
         if len(doc_contents) < len(manifest.documents):
             doc_contents = {
                 **_load_doc_contents_from_document_pack(document_pack),
                 **doc_contents,
             }
-        recall_clauses = _ground_evidence(recall_clauses, doc_contents)
-        recall_clauses = classify_clause_roles(recall_clauses, manifest)
+        recall_clauses = _ground_evidence(recall_clauses, doc_contents, selected_steps)
+        recall_clauses = classify_clause_roles(recall_clauses, manifest, selected_steps)
+        recall_clauses = apply_authorization_guard(recall_clauses, self._a_req)
         self._save_artifact(
             artifact_dir / "recall_clauses.json",
             [clause.model_dump() for clause in recall_clauses],
         )
 
-        a_req_set = set(self._a_req)
-        target_capabilities = {
-            event.capability
-            for event in events
-            if event_requires_authorization(event, a_req_set)
-        }
         merged_clauses = merge_recall_clauses(
             existing_clauses=contract_table.clauses,
             recall_clauses=recall_clauses,
-            target_capabilities=target_capabilities,
         )
         if len(merged_clauses) == len(contract_table.clauses):
             return contract_table
 
+        merged_clauses = preserve_command_conditions(ground_policy_conditions(merged_clauses,doc_contents))
         conflicts = detect_clause_conflicts(merged_clauses)
         merged_contract_table = build_contract_table(
             skill_id,
@@ -397,45 +413,59 @@ class ContractObservationPipeline:
 def _ground_evidence(
     clauses: list[Clause],
     doc_contents: dict[str, str],
+    steps: list[Step] | None = None,
 ) -> list[Clause]:
     """Resolve placeholder evidence spans against the available documents."""
     grounded: list[Clause] = []
     resolved_count = 0
     total_count = 0
 
-    for clause in clauses:
-        new_spans = []
-        for span in clause.evidence_spans:
-            total_count += 1
-            if span.doc_id != "unresolved":
-                new_spans.append(span)
-                resolved_count += 1
-                continue
-            found = False
-            for doc_id, content in doc_contents.items():
-                result = locate_evidence_span(span.text, doc_id, content)
-                if result.start_offset != 0 or result.end_offset != 0:
-                    new_spans.append(result)
-                    resolved_count += 1
-                    found = True
-                    break
-            if not found:
-                new_spans.append(span)
+    steps_by_id = {step.step_id: step for step in steps or []}
 
-        grounded.append(
-            Clause(
-                clause_id=clause.clause_id,
-                capability=clause.capability,
-                operator=clause.operator,
-                role=clause.role,
-                target=clause.target,
-                constraints=clause.constraints,
-                evidence_spans=new_spans,
-                vote_agreement=clause.vote_agreement,
-                step_ids=clause.step_ids,
-                source_doc_ids=clause.source_doc_ids,
-            )
-        )
+    def resolve(span, preferred_docs=(), clause_steps=()):
+        nonlocal resolved_count, total_count
+        total_count += 1
+        if clause_steps:
+            for step_id in clause_steps:
+                step = steps_by_id[step_id]
+                if step.evidence is None or step.doc_id not in doc_contents:
+                    continue
+                result = locate_evidence_span(span.text, step.doc_id, step.evidence.text)
+                if result.end_offset <= result.start_offset:
+                    continue
+                base = step.evidence.start_offset
+                byte_base = len(doc_contents[step.doc_id][:base].encode("utf-8"))
+                resolved_count += 1
+                return result.model_copy(update={
+                    "start_offset": base + result.start_offset,
+                    "end_offset": base + result.end_offset,
+                    "start_byte": byte_base + result.start_byte,
+                    "end_byte": byte_base + result.end_byte,
+                })
+            return span.model_copy(update={"doc_id": "unresolved", "start_offset": 0, "end_offset": 0})
+        for doc_id in dict.fromkeys([span.doc_id, *preferred_docs, *doc_contents]):
+            if doc_id not in doc_contents:
+                continue
+            result = locate_evidence_span(span.text, doc_id, doc_contents[doc_id])
+            if result.end_offset > result.start_offset:
+                resolved_count += 1
+                return result
+        return span.model_copy(update={"doc_id": "unresolved", "start_offset": 0, "end_offset": 0})
+
+    for clause in clauses:
+        if steps is not None and (not clause.step_ids or any(
+                step_id not in steps_by_id for step_id in clause.step_ids)):
+            continue
+        new_spans = [resolve(span, clause.source_doc_ids, clause.step_ids) for span in clause.evidence_spans]
+        new_spans = [span for span in new_spans if span.doc_id != "unresolved"]
+        if not new_spans:
+            continue
+        documents = [span.doc_id for span in new_spans]
+        constraints = [condition.model_copy(update={"evidence": resolve(condition.evidence, documents, clause.step_ids)})
+                       if condition.evidence is not None else condition
+                       for condition in clause.constraints]
+        grounded.append(clause.model_copy(update={"evidence_spans": new_spans, "constraints": constraints,
+                                                  "source_doc_ids": list(dict.fromkeys(documents))}))
 
     logger.info("Evidence grounding: %d/%d spans resolved", resolved_count, total_count)
     return grounded
@@ -476,7 +506,7 @@ def _load_doc_contents_from_document_pack(
         chars = [" "] * max(length, 0)
         for block in sorted(blocks, key=lambda item: (item.start_offset, item.end_offset)):
             start = max(block.start_offset, 0)
-            text = block.content
+            text = block.source_text or block.content
             end = start + len(text)
             if end > len(chars):
                 chars.extend([" "] * (end - len(chars)))
@@ -511,6 +541,9 @@ def _build_contract_graph_artifact(
             step_type=step.step_type,
             heading_context=step.heading_context,
             text=step.text,
+            exec_bound=step.exec_bound,
+            start_byte=step.start_byte,
+            end_byte=step.end_byte,
         )
 
     for edge in step_order_edges:
@@ -529,11 +562,7 @@ def _build_contract_graph_artifact(
                 {
                     "source": step_id,
                     "target": clause.clause_id,
-                    "kind": (
-                        "prohibits"
-                        if clause.operator == ClauseOperator.PROHIBITED
-                        else "declares"
-                    ),
+                    "kind": "declares",
                 }
             )
 
@@ -566,9 +595,12 @@ def _build_contract_graph_artifact(
                 {
                     "source": clause.clause_id,
                     "target": constraint.constraint_id,
-                    "kind": "constrains",
+                    "kind": "has_scope",
                 }
             )
+        if clause.role.value == "policy":
+            for step_id in clause.step_ids:
+                edges.append({"source": clause.clause_id, "target": step_id, "kind": "constrains"})
 
         for index, span in enumerate(clause.evidence_spans):
             evidence_id = f"{clause.clause_id}:ev:{index}"
@@ -582,9 +614,9 @@ def _build_contract_graph_artifact(
             )
             edges.append(
                 {
-                    "source": clause.clause_id,
-                    "target": evidence_id,
-                    "kind": "supported_by",
+                    "source": evidence_id,
+                    "target": clause.clause_id,
+                    "kind": "grounds",
                 }
             )
 

@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  python:
+    name: Python ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    env:
+      PYTHONPYCACHEPREFIX: ${{ runner.temp }}/python-cache
+    strategy:
+      matrix:
+        python-version: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install
+        run: python -m pip install -e .
+      - name: Check dependencies
+        run: python -m pip check
+      - name: Check Python sources
+        run: python -m compileall -q src scripts
+      - name: Check command-line entry points
+        run: |
+          skillrecon --help
+          skillrecon prepare --help
+          skillrecon analyze --help
+          skillrecon batch --help
+          skillrecon baselines --help
+          skillrecon internal-baselines --help
+          skillrecon ablate --help
+          skillrecon perturb --help
+          skillrecon sweep --help
+          skillrecon evaluate --help
+          skillrecon replay --help

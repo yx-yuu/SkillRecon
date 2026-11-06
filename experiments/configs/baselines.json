@@ -1,0 +1,40 @@
+[
+  {
+    "system_id": "baseline_malskills_full",
+    "name": "MalSkills (native full)",
+    "repo_url": "https://github.com/security-pride/MalSkills",
+    "upstream_commit": "46d60f09cef00fd3a9c01272be63dbd273ab4444",
+    "yasa_commit": "89ffcfd9f863c1bacae4588894ff73358e0ad76f",
+    "version": "0.1.0",
+    "install": "Pinned MalSkills/YASA, compiled dist/main.js, Semgrep >=1.168,<2 and authenticated configured LLM"
+  },
+  {
+    "system_id": "baseline_skillfortify",
+    "name": "SkillFortify",
+    "repo_url": "https://github.com/qualixar/skillfortify",
+    "install": "pip install skillfortify==0.3.0",
+    "version": "0.3.0"
+  },
+  {
+    "system_id": "baseline_cisco_skill_scanner",
+    "name": "Cisco Skill Scanner",
+    "repo_url": "https://github.com/cisco-ai-defense/skill-scanner",
+    "install": "pip install cisco-ai-skill-scanner"
+  },
+  {
+    "system_id": "baseline_skillspector",
+    "name": "SkillSpector",
+    "repo_url": "https://github.com/NVIDIA/SkillSpector",
+    "install": "Clone and install SkillSpector with Python 3.12+, or use its Docker image."
+  },
+  {
+    "system_id": "baseline_snyk_agent_scan",
+    "name": "Snyk Agent Scan",
+    "repo_url": "https://github.com/snyk/agent-scan",
+    "install": "uvx snyk-agent-scan@latest scan --json --skills <skill-path>; requires SNYK_TOKEN for normal operation."
+  },
+  {
+    "system_id": "baseline_openclaw",
+    "name": "OpenClaw Scan"
+  }
+]

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "skill_id",
+    "category",
+    "grounded"
+  ],
+  "properties": {
+    "skill_id": {
+      "type": "string"
+    },
+    "category": {
+      "enum": [
+        "V1",
+        "V2",
+        "V3"
+      ]
+    },
+    "grounded": {
+      "type": "boolean"
+    }
+  }
+}

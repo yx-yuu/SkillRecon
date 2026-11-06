@@ -68,12 +68,27 @@ class LLMClient:
     def __init__(self, config: LLMConfig) -> None:
         self._config = config
         _validate_base_url(config.base_url)
-        api_key = _resolve_api_key(config.api_key_env)
+        api_key = _resolve_api_key(config.api_key_env, config.api_key_file)
         self._client = OpenAI(base_url=config.base_url, api_key=api_key)
+        self.last_response_metadata: dict[str, Any] | None = None
 
     @property
     def config(self) -> LLMConfig:
         return self._config
+
+    def _record_response(self, response: Any) -> None:
+        self.last_response_metadata = {
+            "requested_model": self._config.model,
+            "response_model": response.model,
+            "finish_reason": response.choices[0].finish_reason,
+            "usage": response.usage.model_dump() if response.usage is not None else None,
+        }
+        logger.info("LLM response metadata: %s", json.dumps(self.last_response_metadata, ensure_ascii=False))
+        if self.last_response_metadata["finish_reason"] != "stop":
+            raise RuntimeError(
+                "Incomplete LLM response: "
+                f"model={response.model}, finish_reason={response.choices[0].finish_reason}"
+            )
 
     def _is_retryable_error(self, exc: Exception) -> bool:
         if isinstance(exc, _RETRYABLE_EXCEPTIONS):
@@ -122,6 +137,7 @@ class LLMClient:
                 max_tokens=max_tokens if max_tokens is not None else self._config.max_tokens,
             ),
         )
+        self._record_response(response)
         content = response.choices[0].message.content
         return content or ""
 
@@ -165,6 +181,7 @@ class LLMClient:
                 response_format=response_format,
             ),
         )
+        self._record_response(response)
         raw = response.choices[0].message.content or "{}"
         parsed = _try_validate_structured_response(raw, response_model)
         if parsed is not None:
@@ -266,6 +283,7 @@ class LLMClient:
                 max_tokens=max_tokens if max_tokens is not None else self._config.max_tokens,
             ),
         )
+        self._record_response(response)
         return response.choices[0].message.content or "{}"
 
 
@@ -293,13 +311,10 @@ def _json_prompt_messages(
             ),
         )
     instructions.append(f"Schema: {json.dumps(schema, ensure_ascii=False)}")
-    return [
-        *messages,
-        {
-            "role": "system",
-            "content": " ".join(instructions),
-        },
-    ]
+    system_text = "\n\n".join([message["content"] for message in messages
+                                if message["role"] == "system"] + [" ".join(instructions)])
+    return [{"role": "system", "content": system_text},
+            *[message for message in messages if message["role"] != "system"]]
 
 
 def _is_content_filter_error(exc: Exception) -> bool:
@@ -392,14 +407,17 @@ def _validate_base_url(base_url: str) -> None:
         )
 
 
-def _resolve_api_key(api_key_env: str) -> str:
+def _resolve_api_key(api_key_env: str, api_key_file: str | None = None) -> str:
+    if api_key_file is not None:
+        with open(api_key_file, encoding="utf-8") as handle:
+            return json.load(handle)["api_key"]
     value = os.environ.get(api_key_env, "")
     if value:
         return value
     if _looks_like_env_var_name(api_key_env):
         raise ValueError(
             f"LLM API key environment variable {api_key_env!r} is not set. "
-            "Set it before running AI-backed dataset construction, or pass a literal key "
+            "Set it before running SkillRecon, or pass a literal key "
             "only in local throwaway config."
         )
     # Some local configs pass the literal key instead of an env-var name.

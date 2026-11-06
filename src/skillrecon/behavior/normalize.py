@@ -26,6 +26,7 @@ _TIER_PRIORITY = {
     "concepts": 0,
     "api_graph": 1,
     "bash_pattern": 2,
+    "bash_ast": 2,
     "instruction": 3,
 }
 
@@ -61,6 +62,11 @@ def load_sarif_observations(sarif_path: Path, language: str) -> list[RawObservat
         for result in run.get("results", []):
             message = result.get("message", {}).get("text", "")
             fields = parse_structured_message(message)
+            if result.get("ruleId") == "skillrecon/javascript/unsafe-command-construction":
+                # This query refines shell execution with an input-flow proof;
+                # it does not introduce an independent eval permission demand.
+                fields["capType"] = "shell_exec"
+                fields["unsafeCommandConstruction"] = "true"
             if "pathKind" in fields:
                 continue
             location = _first_location(result)
@@ -88,57 +94,48 @@ def load_sarif_observations(sarif_path: Path, language: str) -> list[RawObservat
 
 
 def load_sarif_paths(sarif_path: Path, language: str) -> list[RawPathResult]:
-    """Load CodeQL path-problem SARIF results into structured raw paths."""
+    """Read every CodeQL flow with its own row's endpoint metadata."""
     data = json.loads(sarif_path.read_text(encoding="utf-8"))
-    paths: list[RawPathResult] = []
+    paths = []
 
-    for run in data.get("runs", []):
-        artifacts = run.get("artifacts", [])
-        for result in run.get("results", []):
-            message = result.get("message", {}).get("text", "")
-            fields = parse_structured_message(message)
-            if "pathKind" not in fields:
+    def site(location, artifacts):
+        physical = location['physicalLocation']
+        region = physical['region']
+        return f"{_normalize_relpath(_resolve_artifact_uri(location, artifacts))}:{region['startLine']}:{region.get('startColumn', 1)}"
+
+    identity = ['pathSource', 'pathSink', 'pathKind', 'sourceSlotKind', 'sinkSlotKind']
+    for run in data.get('runs', []):
+        artifacts = run.get('artifacts', [])
+        for result in run.get('results', []):
+            message = result.get('message', {}).get('text', '')
+            rows = [parse_structured_message(line) for line in message.splitlines()
+                    if 'pathKind=' in line]
+            if not rows:
                 continue
-            thread_locations = _first_thread_flow_locations(result)
-            if not thread_locations:
-                continue
-
-            steps: list[RawPathStep] = []
-            for thread_location in thread_locations:
-                if not isinstance(thread_location, dict):
-                    continue
-                location = thread_location.get("location", {})
-                if not isinstance(location, dict):
-                    continue
-                relative_path = _resolve_artifact_uri(location, artifacts)
-                if not relative_path:
-                    continue
-                physical = location.get("physicalLocation", {})
-                if isinstance(physical, dict):
-                    region = physical.get("region", {})
-                    line = region.get("startLine", 0) if isinstance(region, dict) else 0
-                else:
-                    line = 0
-                step_message = location.get("message", {}).get("text", "")
-                steps.append(
-                    RawPathStep(
-                        relative_path=relative_path,
-                        line=line,
-                        message=step_message,
-                    )
-                )
-
-            if len(steps) < 2:
-                continue
-            paths.append(
-                RawPathResult(
-                    language=language,
-                    message=message,
-                    fields=fields,
-                    steps=steps,
-                )
-            )
-
+            located = all('sourceSite' in row and 'sinkSite' in row for row in rows)
+            if not located and len({tuple(row.get(key) for key in identity) for row in rows}) != 1:
+                raise ValueError('Grouped SARIF has ambiguous path metadata; rerun the current query pack with sourceSite/sinkSite')
+            for code_flow in result.get('codeFlows', []):
+                for thread in code_flow.get('threadFlows', []):
+                    locations = [item['location'] for item in thread.get('locations', []) if 'location' in item]
+                    if len(locations) < 2:
+                        continue
+                    matching = ([row for row in rows if row['sourceSite'] == site(locations[0], artifacts)
+                                 and row['sinkSite'] == site(locations[-1], artifacts)] if located else rows)
+                    if not matching:
+                        raise ValueError('CodeQL flow endpoint locations do not match any result metadata row')
+                    steps = []
+                    for location in locations:
+                        relative = _resolve_artifact_uri(location, artifacts)
+                        if relative:
+                            steps.append(RawPathStep(relative_path=relative,
+                                line=location['physicalLocation']['region'].get('startLine', 0),
+                                message=location.get('message', {}).get('text', '')))
+                    if len(steps) < 2:
+                        continue
+                    for fields in matching:
+                        paths.append(RawPathResult(language=language, message=message,
+                                                   fields=fields, steps=steps))
     logger.info("Loaded %d SARIF paths from %s", len(paths), sarif_path)
     return paths
 
@@ -181,9 +178,9 @@ def normalize_observations(
 
     events: list[CapabilityEvent] = []
     resources: list[ResourceUse] = []
-    resource_keys: set[tuple[str, str | None, str, str, str]] = set()
+    resource_keys: set[tuple[str, str | None, str, str, bool, str, str]] = set()
 
-    for idx, key in enumerate(sorted(grouped)):
+    for key in sorted(grouped):
         obs = _pick_best_observation(grouped[key])
         unit_id = key[3]
         detail = obs.fields.get("detail", "")
@@ -191,52 +188,87 @@ def normalize_observations(
         relative_path = _normalize_relpath(obs.relative_path)
         source_line = obs.source_text or _read_source_line(staged_root, relative_path, obs.line)
         location = f"{relative_path}:{obs.line}" if obs.line else relative_path
-        event_id = f"e{idx}"
         capability = _refine_capability(obs.fields["capType"], source_line, detail)
-        extracted = _extract_resources(source_line, detail, capability)
-        explicit_resource = _explicit_resource_hint(obs)
-        if explicit_resource is not None:
+        environment_names = json.loads(obs.fields["environmentNames"]) if tier in {"bash_pattern", "bash_ast"} else None
+        extracted = _extract_resources(source_line, detail, capability, language=obs.language,
+                                       environment_names=environment_names)
+        if "shellArguments" in obs.fields:
+            arguments = json.loads(obs.fields["shellArguments"])
+            alternatives = [tuple(option) for choices in arguments for option in choices]
+            if capability in {"http_request", "websocket", "upload_exfil", "remote_sync", "telemetry_post"}:
+                targets = [(value, resolved) for value, resolved in alternatives
+                           if value.startswith(("http://", "https://", "ws://", "wss://")) or not resolved]
+                if targets:
+                    extracted = [item for item in extracted if item[0] not in {"url", "domain"}]
+                    extracted.extend(("url", value, resolved, "shell_binding", "AST argument binding")
+                                     for value, resolved in targets)
+            if capability in {"file_write", "file_delete", "file_permission_change"} and arguments:
+                targets = [tuple(option) for option in arguments[-1] if not option[0].startswith("-")]
+                if targets:
+                    extracted = [item for item in extracted if item[0] != "path"]
+                    extracted.extend(("path", value, resolved, "shell_binding", "AST argument binding")
+                                     for value, resolved in targets)
+        authoritative = [item for item in grouped[key]
+                         if _TIER_PRIORITY.get(item.fields.get("tier", ""), 99) == _TIER_PRIORITY.get(tier, 99)]
+        explicit_resources = list(dict.fromkeys(hint for item in authoritative
+                                               if (hint := _explicit_resource_hint(item)) is not None))
+        if explicit_resources:
+            explicit_types = {hint[0] for hint in explicit_resources}
             extracted = [
                 item
                 for item in extracted
-                if item[2] or item[0] != explicit_resource[0]
+                if item[0] not in explicit_types
             ]
-            extracted = [explicit_resource, *extracted]
+            extracted = [*explicit_resources, *extracted]
 
-        events.append(
-            CapabilityEvent(
-                event_id=event_id,
-                unit_id=unit_id,
-                capability=capability,
-                api_call=detail,
-                location=location,
-                arguments=[value for _, value, _, _, _ in extracted],
-                tier=tier,
-                language=obs.language,
-                file_path=relative_path,
-                line=obs.line,
-                detail=detail,
-            )
-        )
-
-        for resource_type, value, resolved, origin_kind, origin_hint in extracted:
-            resource_key = (unit_id, event_id, resource_type, value, location)
-            if resource_key in resource_keys:
-                continue
-            resource_keys.add(resource_key)
-            resources.append(
-                ResourceUse(
-                    resource_id=f"r{len(resources)}",
-                    unit_id=unit_id,
+        resource_groups = [extracted]
+        for resource_group in resource_groups:
+            event_id = f"e{len(events)}"
+            events.append(
+                CapabilityEvent(
                     event_id=event_id,
-                    resource_type=resource_type,
-                    value=value,
-                    resolved=resolved,
+                    unit_id=unit_id,
+                    capability=capability,
+                    api_call="environment variable read" if capability == "env_var_read" else detail,
                     location=location,
-                    origin_kind=origin_kind,
-                    origin_hint=origin_hint,
+                    arguments=[value for _, value, _, _, _ in resource_group],
+                    tier=tier,
+                    language=obs.language,
+                    file_path=relative_path,
+                    line=obs.line,
+                    detail=detail,
                 )
             )
+            for resource_type, value, resolved, origin_kind, origin_hint in resource_group:
+                context = origin_hint if origin_kind in {"native_ast", "shell_binding"} else obs.fields.get("branchContext", "")
+                resource_key = (unit_id, event_id, resource_type, value, resolved, location, context)
+                if resource_key in resource_keys:
+                    continue
+                resource_keys.add(resource_key)
+                resources.append(
+                    ResourceUse(
+                        resource_id=f"r{len(resources)}",
+                        unit_id=unit_id,
+                        event_id=event_id,
+                        resource_type=resource_type,
+                        value=value,
+                        resolved=resolved,
+                        location=location,
+                        origin_kind=origin_kind,
+                        origin_hint=origin_hint,
+                        context=context,
+                    )
+                )
+            unsafe = [item for item in grouped[key]
+                      if item.fields.get("unsafeCommandConstruction") == "true"]
+            if unsafe:
+                resources.append(ResourceUse(
+                    resource_id=f"r{len(resources)}", unit_id=unit_id, event_id=event_id,
+                    resource_type="registered_operation", value="shell_exec", resolved=True,
+                    location=location, origin_kind="codeql_dataflow",
+                    origin_hint=json.dumps({"model":"codeql_unsafe_command_construction_v1",
+                        "location":location, "detail":unsafe[0].fields["detail"]}),
+                ))
 
     logger.info(
         "Normalized %d events and %d resources",
@@ -244,6 +276,64 @@ def normalize_observations(
         len(resources),
     )
     return events, resources, bridge_hints
+
+
+def canonicalize_behavior(events, resources, manifest, unit_paths=None, doc_contents=None):
+    """Apply one K_e and strict tier precedence, including document unit provenance."""
+    unit_paths = unit_paths or {}
+    doc_contents = doc_contents or {}
+    synthetic_units = {unit.source_block_id:unit for unit in manifest.code_units if unit.source_doc_id is not None}
+    normalized = []
+    operations = {resource.event_id:resource for resource in resources if resource.resource_type == "registered_operation"}
+    for event in events:
+        proof = operations.get(event.event_id)
+        if event.unit_id.startswith("doc::") and proof is not None:
+            fact = json.loads(proof.origin_hint)
+            unit = synthetic_units.get(fact.get("source_block_id"))
+            if unit is not None and unit.unit_id in unit_paths and unit.source_doc_id in doc_contents:
+                content = doc_contents[unit.source_doc_id]
+                first_body_line = content[:unit.source_offset].count(chr(10)) + 2
+                line = event.line - first_body_line + 1
+                file_path = unit_paths[unit.unit_id]
+                event = event.model_copy(update={"unit_id":unit.unit_id, "file_path":file_path,
+                                                "line":line, "location":f"{file_path}:{line}"})
+        normalized.append(event)
+    groups = defaultdict(list)
+    for event in normalized:
+        groups[(event.file_path, event.line, event.unit_id, event.capability)].append(event)
+    rank = lambda event: _TIER_PRIORITY.get(event.tier, 1 if event.tier == "registered_source" else 99)
+    retained, identifiers, winner_ranks = [], {}, {}
+    normalized_by_id = {event.event_id:event for event in normalized}
+    for group in groups.values():
+        winner = min(group, key=lambda event: (rank(event), event.event_id))
+        # Deterministic documentary clauses use these source-bound IDs. Keep that ID
+        # while taking all semantics and resource bindings from the highest tier.
+        stable_id = min((event.event_id for event in group if event.event_id.startswith("operation-doc::")), default=winner.event_id)
+        config_units = {u.unit_id for u in synthetic_units.values() if u.source_pointer is not None}
+        tier = (3 if winner.unit_id in config_units else
+                4 if winner.unit_id in {u.unit_id for u in synthetic_units.values()} or winner.unit_id.startswith("doc::")
+                else rank(winner) + 1)
+        retained.append(winner.model_copy(update={"event_id":stable_id,"analysis_tier":tier}))
+        winner_ranks[stable_id] = rank(winner)
+        identifiers.update((event.event_id, stable_id) for event in group)
+    target_types = {"url", "domain", "path", "env_var", "command", "import_target"}
+    types_by_winner = defaultdict(set)
+    for resource in resources:
+        winner_id = identifiers.get(resource.event_id, resource.event_id)
+        original = normalized_by_id.get(resource.event_id)
+        if original and rank(original) == winner_ranks[winner_id]:
+            types_by_winner[winner_id].add(resource.resource_type)
+    events_by_id = {event.event_id:event for event in retained}
+    revised = []
+    for resource in resources:
+        winner_id = identifiers.get(resource.event_id, resource.event_id)
+        original = normalized_by_id.get(resource.event_id)
+        if original and resource.resource_type in target_types and rank(original) > winner_ranks[winner_id] and resource.resource_type in types_by_winner[winner_id]:
+            continue
+        winner = events_by_id.get(winner_id)
+        revised.append(resource.model_copy(update={"event_id":winner_id,
+                       **({"unit_id":winner.unit_id} if winner else {})}))
+    return retained, revised, identifiers
 
 
 def _first_location(result: dict[str, object]) -> dict[str, object] | None:

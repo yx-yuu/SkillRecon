@@ -3,17 +3,23 @@
 from __future__ import annotations
 
 import json
+import re
+from skillrecon.loader.inline import is_prohibitive_binding
 from pathlib import Path
 
+from skillrecon.contract.controls import CONTROL_TYPES
 from skillrecon.core.enums import FindingSupportLevel, FindingType, SupportStrength
+from skillrecon.core.sensitivity import event_capability_family
 from skillrecon.core.types import (
     CapabilityEvent,
+    Clause,
     Diagnostic,
     Exposure,
     Finding,
     ResourceUse,
     RiskPath,
 )
+from skillrecon.evaluation.artifacts import artifact_complete
 from skillrecon.evaluation.types import (
     CodeLocation,
     ContractQualityAlertRecord,
@@ -29,13 +35,6 @@ _VIOLATION_SUBTYPES = {
     FindingType.CONTRADICTED_BEHAVIOR,
     FindingType.SCOPE_VIOLATION,
     FindingType.UNJUSTIFIED_COMPOSITION,
-}
-_LOW_SIGNAL_CAPABILITIES = {
-    "data_encode_send",
-    "http_request",
-    "dynamic_import",
-    "shell_exec",
-    "subprocess_spawn",
 }
 _CREDENTIAL_MARKERS = (
     "api_key",
@@ -96,16 +95,32 @@ def build_skillrecon_report(skill_id: str, artifact_dir: Path) -> EvaluationRepo
     events = _load_models(artifact_dir / "event_table.json", CapabilityEvent, allow_missing=True)
     resources = _load_models(artifact_dir / "resource_table.json", ResourceUse, allow_missing=True)
     paths = _load_models(artifact_dir / "path_table.json", RiskPath, allow_missing=True)
+    clauses = _load_models(artifact_dir / "canonical_clauses.json", Clause, allow_missing=True)
+    coverage_path = artifact_dir / "behavior_coverage.json"
+    coverage = json.loads(coverage_path.read_text(encoding="utf-8")) if coverage_path.is_file() else {}
 
     events_by_id = {event.event_id: event for event in events}
     resources_by_id = {resource.resource_id: resource for resource in resources}
     paths_by_id = {path.path_id: path for path in paths}
+    source_event_ids = _bound_source_events(artifact_dir, events, resources)
 
     violation_findings: list[EvaluationFinding] = []
     exposure_findings: list[EvaluationFinding] = []
     contract_quality_alerts: list[ContractQualityAlertRecord] = []
 
     for finding in findings:
+        if finding.finding_type == FindingType.SCOPE_VIOLATION:
+            resource_event_ids = [
+                resources_by_id[resource_id].event_id
+                for resource_id in finding.related_resource_ids
+                if resource_id in resources_by_id
+                and resources_by_id[resource_id].event_id in events_by_id
+            ]
+            finding = finding.model_copy(update={
+                "related_event_ids": list(dict.fromkeys([
+                    *finding.related_event_ids, *resource_event_ids,
+                ])),
+            })
         if finding.finding_type in _VIOLATION_SUBTYPES:
             evaluation_finding = _evaluation_finding_from_finding(
                 finding=finding,
@@ -119,12 +134,17 @@ def build_skillrecon_report(skill_id: str, artifact_dir: Path) -> EvaluationRepo
                 events_by_id=events_by_id,
                 resources_by_id=resources_by_id,
                 paths_by_id=paths_by_id,
+                source_event_ids=source_event_ids,
             ):
                 violation_findings.append(evaluation_finding)
             else:
-                exposure_findings.append(
-                    evaluation_finding.model_copy(update={"main_label": "exposure-only"})
-                )
+                contract_quality_alerts.append(ContractQualityAlertRecord(
+                    alert_id=finding.finding_id, alert_type="unconfirmed_finding",
+                    affected_clauses=finding.related_clause_ids,
+                    related_event_ids=finding.related_event_ids,
+                    code_locations=evaluation_finding.code_locations,
+                    rationale=finding.rationale,
+                ))
             continue
 
     for exposure in exposures:
@@ -176,6 +196,8 @@ def build_skillrecon_report(skill_id: str, artifact_dir: Path) -> EvaluationRepo
 
     return EvaluationReport(
         skill_id=skill_id,
+        config={"analysis_status": coverage.get("analysis_status", "unverified") if artifact_complete(artifact_dir) else "incomplete",
+                "behavior_analysis_status":coverage.get("analysis_status", "unverified")},
         graphs=ReportGraphs(
             g_d=_graph_stats(artifact_dir / "g_d.json"),
             g_c=_graph_stats(artifact_dir / "g_c.json"),
@@ -229,29 +251,46 @@ def _finding_has_violation_evidence(
     events_by_id: dict[str, CapabilityEvent],
     resources_by_id: dict[str, ResourceUse],
     paths_by_id: dict[str, RiskPath],
+    source_event_ids: set[str],
 ) -> bool:
-    events = [
-        events_by_id[event_id]
-        for event_id in finding.related_event_ids
-        if event_id in events_by_id
-    ]
+    """Use certificate evidence, without a second suspiciousness classifier."""
+    if finding.support_level != FindingSupportLevel.GRAPH_BACKED or finding.support_strength != SupportStrength.STRONG:
+        return False
+    event_ids = set(finding.related_event_ids)
+    event_ids.update(resources_by_id[r].event_id for r in finding.related_resource_ids if r in resources_by_id)
+    if finding.finding_type == FindingType.UNJUSTIFIED_COMPOSITION:
+        return bool(finding.related_path_ids) and all(
+            path_id in paths_by_id and paths_by_id[path_id].evidence_level in {"codeql","bridge","registered_source"}
+            for path_id in finding.related_path_ids) and bool(event_ids & source_event_ids)
+    return bool(event_ids & source_event_ids)
 
-    if _has_high_risk_code_evidence(finding, events, resources_by_id, paths_by_id):
-        return True
 
-    if finding.support_level == FindingSupportLevel.GRAPH_BACKED and finding.support_strength in {
-        SupportStrength.STRONG,
-        SupportStrength.MIXED,
-        SupportStrength.WEAK_ORCHESTRATED,
-        SupportStrength.WEAK_STRUCTURAL,
-    }:
-        return any(
-            _is_code_event(event)
-            and event.capability not in _LOW_SIGNAL_CAPABILITIES
-            for event in events
-        )
-
-    return False
+def _has_documented_control_violation(finding, clauses, events_by_id, resources_by_id, source_event_ids):
+    """A proved explicit control violation is more than a generic network exposure."""
+    if finding.support_level != FindingSupportLevel.GRAPH_BACKED or finding.support_strength != SupportStrength.STRONG:
+        return False
+    constraints = [constraint for clause in clauses
+                   for constraint in clause.constraints if constraint.constraint_type in CONTROL_TYPES
+                   and (constraint.constraint_id in finding.related_constraint_ids
+                        or clause.clause_id in finding.related_clause_ids)]
+    if finding.finding_type == FindingType.SCOPE_VIOLATION:
+        resources = [resources_by_id[key] for key in finding.related_resource_ids]
+        expected = "false"
+    elif finding.finding_type == FindingType.CONTRADICTED_BEHAVIOR:
+        resources = [r for r in resources_by_id.values() if r.event_id in finding.related_event_ids]
+        expected = "true"
+    else:
+        return False
+    return any(r.resource_type == "control_condition" and r.resolved
+               and r.value == f"{c.constraint_type}:{c.value}"
+               and r.event_id in events_by_id and (
+                   r.event_id in source_event_ids or (
+                       events_by_id[r.event_id].tier == "registered_source"
+                       and events_by_id[r.event_id].api_call == "JSON-RPC credential argument"
+                       and json.loads(r.origin_hint)["model"] == "json_rpc_credential_source_v1"
+                   ))
+               and json.loads(r.origin_hint)["result"] == expected
+               for c in constraints for r in resources)
 
 
 def _has_high_risk_code_evidence(
@@ -259,16 +298,35 @@ def _has_high_risk_code_evidence(
     events: list[CapabilityEvent],
     resources_by_id: dict[str, ResourceUse],
     paths_by_id: dict[str, RiskPath],
+    source_event_ids: set[str],
 ) -> bool:
-    code_events = [event for event in events if _is_code_event(event)]
+    code_events = [event for event in events if event.event_id in source_event_ids]
     if not code_events:
         return False
 
     for event in code_events:
         event_text = _event_text(event)
+        linked = [r for r in resources_by_id.values() if r.event_id == event.event_id]
+        if (event.capability in {"shell_exec", "subprocess"}
+                and any(r.resource_type == "registered_operation" and r.resolved
+                        and r.origin_kind == "codeql_dataflow"
+                        and json.loads(r.origin_hint)["model"] == "codeql_unsafe_command_construction_v1"
+                        for r in linked)):
+            return True
+        if (event.capability == "http_request"
+                and finding.support_level == FindingSupportLevel.GRAPH_BACKED
+                and finding.support_strength == SupportStrength.STRONG
+                and any(r.resource_type == "request_credential" and r.resolved for r in linked)
+                and any(r.resource_type in {"url", "domain"} and r.resolved for r in linked)):
+            return True
         if event.capability == "eval_exec":
             return True
-        if event.capability == "env_var_read" and _contains_credential_marker(event_text):
+        if (event.capability == "file_permission_change"
+                and event.tier == "registered_source"
+                and event.api_call == "permission policy write"
+                and "permissions.defaultmode=bypasspermissions" in event_text):
+            return True
+        if event.capability == "env_var_read" and event_capability_family(event) == "secret_env_var_read":
             return True
         if event.capability == "deserialization" and "pickle" in event_text:
             return True
@@ -291,6 +349,32 @@ def _has_high_risk_code_evidence(
     return False
 
 
+def _bound_source_events(artifact_dir, events, resources):
+    """Admit source-bound operations regardless of their Markdown display path."""
+    result={e.event_id for e in events if _is_code_event(e)}
+    unreachable=set()
+    for resource in resources:
+        if resource.resource_type == 'control_condition' and resource.resolved:
+            proof=json.loads(resource.origin_hint)
+            if proof.get('model') == 'json_rpc_credential_source_v1' and proof.get('binding_instruction'):
+                result.add(resource.event_id)
+        if resource.resource_type != 'registered_operation' or not resource.resolved:continue
+        proof=json.loads(resource.origin_hint)
+        if proof.get('model') == 'operational_shell_v1':
+            if proof['reachable']:result.add(resource.event_id)
+            else:unreachable.add(resource.event_id)
+    path=artifact_dir/'package_manifest.json'
+    if path.exists():
+        manifest=json.loads(path.read_text())
+        units={u['unit_id'] for u in manifest['code_units']
+               if u.get('source_doc_id') and u.get('source_block_id')
+               and re.search(r'(?i)\b(?:run|execute|invoke)\b|执行|运行|调用',u.get('binding_instruction') or '')
+               and not is_prohibitive_binding(u.get('binding_instruction') or '')
+               and u['language'] in {'python','javascript','typescript','bash'}}
+        result.update(e.event_id for e in events if e.unit_id in units and e.tier != 'instruction')
+    return result-unreachable
+
+
 def _is_code_event(event: CapabilityEvent) -> bool:
     path = event.file_path or event.location.rsplit(":", 1)[0]
     path_lower = path.lower()
@@ -299,11 +383,6 @@ def _is_code_event(event: CapabilityEvent) -> bool:
     if event.tier == "instruction":
         return False
     if path_lower.endswith((".md", ".json", ".yaml", ".yml", ".txt", ".rst")):
-        return False
-    parts = path_lower.replace("\\", "/").split("/")
-    if "tests" in parts or any(part.startswith("test_") for part in parts):
-        return False
-    if path_lower.rsplit("/", 1)[-1].startswith("test_"):
         return False
     return True
 
@@ -331,7 +410,7 @@ def _is_opaque_installer_event(event_text: str) -> bool:
 
 
 def _is_local_service_bridge(event: CapabilityEvent) -> bool:
-    if event.capability not in {"http_request", "data_encode_send", "dynamic_import"}:
+    if event.capability not in {"http_request", "data_encode", "dynamic_import"}:
         return False
     event_text = _event_text(event)
     return "localhost" in event_text or "127.0.0.1" in event_text
@@ -351,12 +430,13 @@ def _has_local_state_to_remote_flow(events: list[CapabilityEvent]) -> bool:
     dynamic_remote = False
     local_state = False
     for event in events:
-        if event.capability != "data_encode_send":
+        if event.capability != "data_encode":
             continue
         args = [arg.lower() for arg in event.arguments]
+        # <dynamic-url> is an unresolved extractor placeholder. It cannot
+        # establish a remote endpoint just because another JSON call names a file.
         dynamic_remote = dynamic_remote or any(
-            "<dynamic-url>" in arg or arg.startswith(("http://", "https://"))
-            for arg in args
+            arg.startswith(("http://", "https://")) for arg in args
         )
         local_state = local_state or any(
             arg.endswith(_LOCAL_STATE_SUFFIXES) and "<dynamic-url>" not in arg

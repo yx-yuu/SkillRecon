@@ -12,6 +12,7 @@ from skillrecon.contract.parser import parse_frontmatter_fields, parse_yaml_fron
 from skillrecon.contract.pipeline import _build_contract_graph_artifact, _ground_evidence
 from skillrecon.contract.recall import merge_recall_clauses
 from skillrecon.contract.voting import aggregate_samples, build_contract_table, detect_clause_conflicts
+from skillrecon.contract.requirements import ground_policy_conditions, preserve_command_conditions
 from skillrecon.core.config import AnalyzerConfig
 from skillrecon.core.types import (
     Bridge,
@@ -94,7 +95,8 @@ def _materialize_single_ablation(
     variant_dir = output_root / skill_id
     if variant_dir.exists():
         shutil.rmtree(variant_dir)
-    shutil.copytree(base_artifact_dir, variant_dir)
+    shutil.copytree(base_artifact_dir, variant_dir,
+        ignore=lambda source,names: {'witness_bundles'} if Path(source)==base_artifact_dir else set())
     remove_status_artifact(variant_dir)
 
     manifest = PackageManifest.model_validate_json(
@@ -113,6 +115,7 @@ def _materialize_single_ablation(
         OrchestrationHypothesis,
     )
     paths = _load_model_list(base_artifact_dir / "path_table.json", RiskPath)
+    deterministic = _load_model_list(base_artifact_dir / "deterministic_clauses.json", Clause)
 
     if system_id == "ablation_no_iccm":
         contract_table = _build_deterministic_only_contract_table(
@@ -122,6 +125,7 @@ def _materialize_single_ablation(
             steps=steps,
             step_edges=step_edges,
             unresolved_refs=document_pack.unresolved_references,
+            deterministic_clauses=deterministic,
         )
         ablation_paths = paths
     elif system_id == "ablation_no_scope_constraints":
@@ -147,6 +151,8 @@ def _materialize_single_ablation(
             events=events,
             raw_samples_path=base_artifact_dir / "raw_clause_samples.json",
             raw_recall_samples_path=base_artifact_dir / "recall_raw_clause_samples.json",
+            deterministic_clauses=deterministic,
+            agreement_threshold=analyzer_config.vote_policy.agreement_threshold,
         )
         ablation_paths = paths
     else:
@@ -209,9 +215,9 @@ def _build_deterministic_only_contract_table(
     steps: list[Step],
     step_edges: list[StepOrderEdge],
     unresolved_refs: list[str],
+    deterministic_clauses: list[Clause],
 ) -> ContractTable:
-    clauses = _extract_deterministic_clauses(skill_path=skill_path, manifest=manifest)
-    clauses = classify_clause_roles(clauses, manifest)
+    clauses = deterministic_clauses
     return build_contract_table(
         skill_id,
         clauses,
@@ -233,30 +239,26 @@ def _build_unguarded_contract_table(
     events: list[CapabilityEvent],
     raw_samples_path: Path,
     raw_recall_samples_path: Path,
+    deterministic_clauses: list[Clause],
+    agreement_threshold: float,
 ) -> ContractTable:
-    deterministic_clauses = _extract_deterministic_clauses(skill_path=skill_path, manifest=manifest)
     doc_contents = _load_doc_contents(skill_path=skill_path, manifest=manifest)
-    llm_clauses = _aggregate_clause_samples(raw_samples_path)
-    llm_clauses = _ground_evidence(llm_clauses, doc_contents)
-    llm_clauses = classify_clause_roles(llm_clauses, manifest)
+    llm_clauses = _aggregate_clause_samples(raw_samples_path, agreement_threshold)
+    llm_clauses = _ground_evidence(llm_clauses, doc_contents, steps)
+    llm_clauses = classify_clause_roles(llm_clauses, manifest, steps)
 
     all_clauses = deterministic_clauses + llm_clauses
     recall_path = raw_recall_samples_path
     if recall_path.exists():
-        recall_clauses = _aggregate_clause_samples(recall_path)
-        recall_clauses = _ground_evidence(recall_clauses, doc_contents)
-        recall_clauses = classify_clause_roles(recall_clauses, manifest)
-        target_capabilities = {
-            event.capability
-            for event in events
-        }
+        recall_clauses = _aggregate_clause_samples(recall_path, agreement_threshold)
+        recall_clauses = _ground_evidence(recall_clauses, doc_contents, steps)
+        recall_clauses = classify_clause_roles(recall_clauses, manifest, steps)
         all_clauses = merge_recall_clauses(
             existing_clauses=all_clauses,
             recall_clauses=recall_clauses,
-            target_capabilities=target_capabilities,
         )
 
-    all_clauses = classify_clause_roles(all_clauses, manifest)
+    all_clauses=preserve_command_conditions(ground_policy_conditions(all_clauses,doc_contents))
     return build_contract_table(
         skill_id,
         all_clauses,
@@ -269,7 +271,7 @@ def _build_unguarded_contract_table(
 
 def _strip_scope_constraints(contract_table: ContractTable) -> ContractTable:
     stripped_clauses = [
-        clause.model_copy(update={"target": None, "constraints": []})
+        clause.model_copy(update={"constraints": []})
         for clause in contract_table.clauses
     ]
     return build_contract_table(
@@ -300,7 +302,7 @@ def _extract_deterministic_clauses(*, skill_path: Path, manifest: PackageManifes
     return deterministic_clauses
 
 
-def _aggregate_clause_samples(path: Path) -> list[Clause]:
+def _aggregate_clause_samples(path: Path, agreement_threshold: float) -> list[Clause]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     samples = [
         [ClauseSample.model_validate(item) for item in group]
@@ -308,7 +310,7 @@ def _aggregate_clause_samples(path: Path) -> list[Clause]:
     ]
     if not samples:
         return []
-    return aggregate_samples(samples, n_samples=len(samples))
+    return aggregate_samples(samples, n_samples=len(samples), agreement_threshold=agreement_threshold)
 
 
 def _write_contract_artifacts(*, artifact_dir: Path, contract_table: ContractTable) -> None:

@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import logging
+import re
 from collections import defaultdict
 
 from skillrecon.contract.normalize import normalize_clause_surface
-from skillrecon.core.enums import ClauseOperator
+from skillrecon.core.enums import ClauseOperator, ClauseRole
 from skillrecon.core.types import (
     Clause,
     ClauseSample,
+    Constraint,
     ContractTable,
     EvidenceSpan,
     Step,
@@ -18,7 +20,7 @@ from skillrecon.core.types import (
 
 logger = logging.getLogger(__name__)
 
-type SemanticKey = tuple[str, str, str, str]
+type SemanticKey = tuple[str, str, str, tuple[tuple[str, str], ...]]
 _GENERIC_SCOPE_TERMS = {
     "files",
     "data",
@@ -31,7 +33,7 @@ _GENERIC_SCOPE_TERMS = {
 }
 _CAPABILITY_CUES: dict[str, tuple[str, ...]] = {
     "shell_exec": ("bash", "shell", "command", "run", "execute"),
-    "subprocess_spawn": ("subprocess", "spawn", "process", "run"),
+    "subprocess": ("subprocess", "spawn", "process", "run"),
     "http_request": ("http", "https", "request", "fetch", "api"),
     "dynamic_import": ("import", "module", "plugin", "package"),
     "env_var_read": ("env", "environment", "os.getenv", "os.environ"),
@@ -70,7 +72,7 @@ def _normalize_target(target: str | None) -> str:
     """Normalize target string for grouping key."""
     if target is None:
         return ""
-    return target.strip().lower()
+    return target.strip()
 
 
 def _normalize_constraint(constraint: str | None) -> str:
@@ -82,11 +84,16 @@ def _normalize_constraint(constraint: str | None) -> str:
 
 def _sample_key(sample: ClauseSample) -> SemanticKey:
     """Semantic key for merging semantically equivalent clause samples."""
+    target, constraints = normalize_clause_surface(
+        sample.capability, sample.target,
+        [*sample.constraints, *([sample.constraint] if sample.constraint else [])],
+        clause_id="vote-key",
+    )
     return (
         sample.step_id,
         sample.capability,
-        _normalize_target(sample.target),
-        _normalize_constraint(sample.constraint),
+        _normalize_target(target),
+        tuple(sorted((c.constraint_type, c.value.strip()) for c in constraints)),
     )
 
 
@@ -95,7 +102,7 @@ def _semantic_clause_key(clause: Clause) -> tuple[str, str, tuple[str, ...]]:
     return (
         clause.capability,
         _normalize_target(clause.target),
-        tuple(sorted(constraint.value.strip().lower() for constraint in clause.constraints)),
+        tuple(sorted(f"{constraint.constraint_type}:{constraint.value.strip()}" for constraint in clause.constraints)),
     )
 
 
@@ -193,6 +200,7 @@ def _build_clause(
             original_target = sample.target
         if sample.constraint:
             constraint_texts.add(sample.constraint)
+        constraint_texts.update(sample.constraints)
         step_ids.add(sample.step_id)
         source_docs.add(
             sample.step_id.split("_")[0] if "_" in sample.step_id else sample.step_id
@@ -231,21 +239,12 @@ def apply_authorization_guard(
     guarded: list[Clause] = []
 
     for clause in clauses:
+        if clause.role == ClauseRole.KNOWLEDGE:
+            guarded.append(clause)
+            continue
         normalized_clause = _normalize_authorization_surface(clause)
         if normalized_clause.capability in a_req_set:
             is_authorization_specific = _is_authorization_specific(normalized_clause)
-            if normalized_clause.operator == ClauseOperator.UNKNOWN and is_authorization_specific:
-                logger.info(
-                    "Authorization guard: promoting '%s' from unknown to allowed "
-                    "(specific operational authorization recovered)",
-                    normalized_clause.capability,
-                )
-                guarded.append(
-                    normalized_clause.model_copy(
-                        update={"operator": ClauseOperator.ALLOWED}
-                    )
-                )
-                continue
             if (
                 normalized_clause.operator == ClauseOperator.ALLOWED
                 and not is_authorization_specific
@@ -267,6 +266,25 @@ def apply_authorization_guard(
 
 def _normalize_authorization_surface(clause: Clause) -> Clause:
     if clause.target and not _is_specific_value(clause.target):
+        if (
+            clause.operator == ClauseOperator.PROHIBITED
+            and not (
+                clause.target.strip().lower() in {"files", "all files", "any file"}
+                and clause.capability.startswith(("file_", "temp_file_", "token_file_"))
+                or clause.target.strip().lower() in {"internet", "the internet", "network"}
+                and clause.capability in {"http_request", "upload_exfil", "data_encode", "websocket", "socket_connect", "dns_query", "smtp_send", "ftp_transfer", "ssh_connect"}
+            )
+        ):
+            # A relative referent such as "the source file" restricts the ban.
+            # Losing that referent would turn it into a capability-wide ban.
+            constraints = list(clause.constraints)
+            if not any(c.constraint_type == "scope" and c.value == clause.target for c in constraints):
+                constraints.append(Constraint(
+                    constraint_id=f"{clause.clause_id}_target_scope",
+                    constraint_type="scope", value=clause.target,
+                    evidence=clause.evidence_spans[0] if clause.evidence_spans else None,
+                ))
+            return clause.model_copy(update={"target": None, "constraints": constraints})
         return clause.model_copy(update={"target": None})
     return clause
 
@@ -282,24 +300,61 @@ def _is_authorization_specific(clause: Clause) -> bool:
         ]
         if part
     )
-    has_authorization_signal = any(sig in combined_text for sig in _AUTHORIZATION_SIGNALS)
-    has_structured_authorization = any(
-        sig in combined_text for sig in {"allowed-tools", "allowed_tools"}
-    )
+    has_authorization_signal = bool(re.search(
+        r"\b(?:allow(?:ed)?|permit(?:ted)?|authoriz(?:e|ed)|grant(?:ed)?|may|must|shall|require(?:s|d)?)\b|允许|授权|必须|应当",
+        evidence_text,
+    ))
+    has_structured_authorization = any(step.endswith("_frontmatter") for step in clause.step_ids)
     has_capability_cue = any(
-        cue in combined_text for cue in _CAPABILITY_CUES.get(clause.capability, ())
+        cue in evidence_text for cue in _CAPABILITY_CUES.get(clause.capability, ())
     )
     has_specific_target = _is_specific_value(clause.target)
     has_specific_constraint = any(
-        _is_specific_value(constraint.value) or _looks_authorizing_constraint(constraint.value)
+        _is_specific_value(constraint.value)
         for constraint in clause.constraints
     )
-    capability_specific = _capability_specific_authorization(clause, combined_text)
-    return has_structured_authorization or capability_specific or (
+    return has_structured_authorization or has_concrete_boundary(clause) or (
         has_authorization_signal
         and has_capability_cue
         and (has_specific_target or has_specific_constraint)
     )
+
+
+def has_concrete_boundary(clause: Clause) -> bool:
+    """Equation A1 B: a source-grounded operational resource, not punctuation."""
+    source = " ".join(" ".join(span.text.split()) for span in clause.evidence_spans)
+    generic = {"*", "**", "./*", "./**", "/*", "/**"}
+    domain = re.compile(r"^(?:\*\.)?[A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)+(?::\d+)?(?:/[^\s]*)?$")
+    env = re.compile(r"^[A-Z_][A-Z0-9_]*$")
+
+    def concrete(value, kind):
+        value = " ".join(value.strip().split())
+        if not value or value in generic or value.lower() in _GENERIC_SCOPE_TERMS or value not in source:
+            return False
+        if kind in {"env_var", "env_glob", "empty_disables", "opt_out_env"}:
+            return bool(env.fullmatch(value)) or kind == "env_glob" and bool(re.fullmatch(r"[A-Z_][A-Z0-9_*?]*", value))
+        if kind in {"url", "url_glob", "domain", "domain_glob", "host", "network"}:
+            return bool(re.fullmatch(r"[A-Za-z][A-Za-z0-9+.-]*://[^\s]+", value)
+                        or domain.fullmatch(value) or env.fullmatch(value)
+                        or value.startswith("/") and not re.search(r"\s", value))
+        if kind in {"command", "command_glob", "interpreter"}:
+            return bool(re.match(r"^[A-Za-z0-9_./~-]+(?:\s|$)", value))
+        if kind in {"path", "path_glob", "prefix", "location", "file"}:
+            return bool("/" in value or "\\" in value or re.search(r"\.[A-Za-z0-9]+(?:[*?])?$", value)
+                        or f"`{value}`" in source)
+        return False
+
+    boundary_types = {"path", "path_glob", "prefix", "location", "env_var", "env_glob",
+                      "empty_disables", "opt_out_env", "domain", "domain_glob", "host",
+                      "url", "url_glob", "command", "command_glob", "interpreter"}
+    if any(concrete(c.value, c.constraint_type) for c in clause.constraints if c.constraint_type in boundary_types):
+        return True
+    if clause.target:
+        kind = ("network" if clause.capability in {"http_request", "websocket", "ssh_connect", "dns_query", "socket_connect", "upload_exfil", "remote_sync", "telemetry_post", "ftp_transfer", "smtp_send"}
+                else "command" if clause.capability in {"shell_exec", "subprocess", "dynamic_import", "eval_exec"}
+                else "env_var" if clause.capability == "env_var_read" else "file")
+        return concrete(clause.target, kind)
+    return False
 
 
 def _capability_specific_authorization(clause: Clause, combined_text: str) -> bool:
@@ -321,7 +376,7 @@ def _capability_specific_authorization(clause: Clause, combined_text: str) -> bo
             or has_specific_http_target(clause.target)
             or any(_looks_authorizing_constraint(value) for value in constraint_values)
         )
-    if clause.capability in {"shell_exec", "subprocess_spawn"}:
+    if clause.capability in {"shell_exec", "subprocess"}:
         return has_command_hint and any(
             _is_specific_value(constraint.value) or constraint.constraint_type.startswith("command")
             for constraint in clause.constraints
@@ -366,7 +421,7 @@ def _is_specific_value(value: str | None) -> bool:
     if value is None:
         return False
     normalized = value.strip().lower()
-    if not normalized or normalized in _GENERIC_SCOPE_TERMS:
+    if not normalized or normalized in _GENERIC_SCOPE_TERMS or normalized in {"*", "**", "./*", "./**", "/*", "/**"}:
         return False
     return any(token in normalized for token in ("/", ".", ":", "*", "_", "-", "http"))
 
@@ -412,15 +467,20 @@ def locate_evidence_span(
             start_offset=idx,
             end_offset=idx + len(evidence_text),
             text=evidence_text,
+            start_byte=len(doc_content[:idx].encode("utf-8")),
+            end_byte=len(doc_content[:idx + len(evidence_text)].encode("utf-8")),
         )
 
-    idx = doc_content.lower().find(evidence_text.lower())
-    if idx >= 0:
+    tokens = re.findall(r"\S+", evidence_text)
+    match = re.search(r"\s+".join(re.escape(token) for token in tokens), doc_content) if tokens else None
+    if match is not None:
         return EvidenceSpan(
             doc_id=doc_id,
-            start_offset=idx,
-            end_offset=idx + len(evidence_text),
-            text=doc_content[idx : idx + len(evidence_text)],
+            start_offset=match.start(),
+            end_offset=match.end(),
+            text=doc_content[match.start():match.end()],
+            start_byte=len(doc_content[:match.start()].encode("utf-8")),
+            end_byte=len(doc_content[:match.end()].encode("utf-8")),
         )
 
     logger.debug("Evidence not found in doc %s: %s", doc_id, evidence_text[:50])

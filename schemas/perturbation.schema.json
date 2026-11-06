@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "skill_id",
+    "kind",
+    "file",
+    "original",
+    "replacement"
+  ],
+  "properties": {
+    "skill_id": {
+      "type": "string"
+    },
+    "kind": {
+      "enum": [
+        "missing_authorization",
+        "stale_resource",
+        "ambiguous_scope",
+        "conflicting_allow_prohibit"
+      ]
+    },
+    "file": {
+      "type": "string"
+    },
+    "original": {
+      "type": "string"
+    },
+    "replacement": {
+      "type": "string"
+    },
+    "start_byte": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "gold": {
+      "description": "The single supervision field used by evaluation datasets.",
+      "properties": {
+        "label": {
+          "enum": [
+            "violation",
+            "exposure-only",
+            "benign"
+          ],
+          "title": "Label",
+          "type": "string"
+        },
+        "violation_subtype": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Violation Subtype"
+        },
+        "violation_subtypes": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "title": "Violation Subtypes",
+          "type": "array"
+        },
+        "rationale": {
+          "default": "",
+          "title": "Rationale",
+          "type": "string"
+        }
+      },
+      "required": [
+        "label"
+      ],
+      "title": "GoldLabel",
+      "type": "object"
+    }
+  }
+}

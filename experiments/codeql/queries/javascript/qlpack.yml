@@ -1,4 +1,4 @@
 name: skillrecon/javascript-queries
 version: 0.0.1
 dependencies:
-  codeql/javascript-all: "*"
+  codeql/javascript-all: "2.10.3"

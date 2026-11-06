@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import heapq
 from itertools import combinations
 
 from skillrecon.core.enums import (
@@ -33,6 +34,7 @@ class WitnessBundle:
     witnesses: list[Witness]
     validations: list[WitnessValidation]
     permission_manifest: list[PermissionManifestEntry]
+    evidence_graph: dict
 
 
 @dataclass
@@ -53,62 +55,15 @@ def assemble_witnesses(
     judgments: list[ReconciliationJudgment],
     certificates: list[Certificate],
     projection_edges: list[ReconciliationEdge],
+    *,
+    replay_inputs: dict,
+    n_max: int = 18,
+    m_max: int = 36,
 ) -> WitnessBundle:
-    """Assemble certificate-closed witnesses from 03 artifacts."""
-    judgments_by_id = {judgment.judgment_id: judgment for judgment in judgments}
-    certificates_by_id = {
-        certificate.certificate_id: certificate for certificate in certificates
-    }
-    judgment_ids = set(judgments_by_id)
-    certificate_ids = set(certificates_by_id)
-
-    witnesses: list[Witness] = []
-    validations: list[WitnessValidation] = []
-
-    for index, finding in enumerate(findings, start=1):
-        neighborhood = build_proof_neighborhood(
-            finding,
-            judgments_by_id,
-            certificates_by_id,
-            projection_edges,
-            judgment_ids,
-            certificate_ids,
-        )
-        witness = search_minimal_witness(
-            witness_id=f"witness-{index:04d}",
-            finding=finding,
-            neighborhood=neighborhood,
-            judgments_by_id=judgments_by_id,
-            certificates_by_id=certificates_by_id,
-            projection_edges_by_id={edge.edge_id: edge for edge in projection_edges},
-        )
-        validation = validate_witness(
-            finding,
-            witness,
-            judgments_by_id,
-            certificates_by_id,
-            {edge.edge_id: edge for edge in projection_edges},
-        )
-        witnesses.append(
-            witness.model_copy(
-                update={
-                    "revalidation_passed": validation.passed,
-                    "support_strength": _collapse_witness_support_strength(
-                        finding,
-                        witness,
-                        {edge.edge_id: edge for edge in projection_edges},
-                    ),
-                }
-            )
-        )
-        validations.append(validation)
-
-    permission_manifest = build_permission_manifest(judgments, certificates)
-    return WitnessBundle(
-        witnesses=witnesses,
-        validations=validations,
-        permission_manifest=permission_manifest,
-    )
+    """Run Algorithm B1 with the actual source facts used by reconciliation."""
+    from skillrecon.detect.evidence_graph import assemble_evidence_witnesses
+    return assemble_evidence_witnesses(findings, judgments, certificates,
+        projection_edges, replay_inputs, n_max=n_max, m_max=m_max)
 
 
 def build_proof_neighborhood(
@@ -146,6 +101,11 @@ def build_proof_neighborhood(
         for edge in projection_edges
         if set(edge.source_judgment_ids).intersection(witness_judgment_ids)
     ]
+    for edge in projection_edges:
+        if edge.edge_id in edge_ids:
+            fact_node_ids.update(ref for ref in [edge.clause_id, edge.constraint_id,
+                edge.step_id, edge.code_unit_id, edge.event_id, edge.resource_id,
+                edge.path_id] if ref)
     return ProofNeighborhood(
         anchor_ids=anchor_ids,
         fact_node_ids=sorted(fact_node_ids),
@@ -163,34 +123,19 @@ def search_minimal_witness(
     judgments_by_id: dict[str, ReconciliationJudgment],
     certificates_by_id: dict[str, Certificate],
     projection_edges_by_id: dict[str, ReconciliationEdge],
+    n_max: int = 18,
+    m_max: int = 36,
 ) -> Witness:
-    """Search the smallest valid witness inside a bounded proof neighborhood."""
-    total_nodes = (
-        len(neighborhood.anchor_ids)
-        + len(neighborhood.fact_node_ids)
-        + len(neighborhood.judgment_ids)
-        + len(neighborhood.certificate_ids)
-    )
-    if (
-        total_nodes <= _EXACT_NODE_LIMIT
-        and len(neighborhood.projection_edge_ids) <= _EXACT_EDGE_LIMIT
-    ):
-        return _exact_search_witness(
-            witness_id=witness_id,
-            finding=finding,
-            neighborhood=neighborhood,
-            judgments_by_id=judgments_by_id,
-            certificates_by_id=certificates_by_id,
-            projection_edges_by_id=projection_edges_by_id,
-        )
-    return _greedy_witness(
-        witness_id=witness_id,
-        finding=finding,
-        neighborhood=neighborhood,
-        judgments_by_id=judgments_by_id,
-        certificates_by_id=certificates_by_id,
-        projection_edges_by_id=projection_edges_by_id,
-    )
+    """Algorithm B1: exact local search, or one greedy pass then frozen acceptance."""
+    whole = _make_witness(witness_id, finding, neighborhood, True)
+    objective = _graph_objective(whole, judgments_by_id, certificates_by_id, projection_edges_by_id)
+    search = _exact_search_witness if objective[0] <= n_max and objective[1] <= m_max else _greedy_witness
+    result = search(witness_id=witness_id, finding=finding, neighborhood=neighborhood,
+                    judgments_by_id=judgments_by_id, certificates_by_id=certificates_by_id,
+                    projection_edges_by_id=projection_edges_by_id)
+    rank = _graph_objective(result, judgments_by_id, certificates_by_id, projection_edges_by_id)
+    return result.model_copy(update={"rank_tuple": rank[:2], "lex_id": repr(rank[2]),
+                                    "neighborhood_nodes": objective[0], "neighborhood_edges": objective[1]})
 
 
 def validate_witness(
@@ -206,7 +151,7 @@ def validate_witness(
         judgments_by_id,
         certificates_by_id,
         projection_edges_by_id,
-        require_projection_edge=finding.support_level == FindingSupportLevel.GRAPH_BACKED,
+        require_projection_edge=finding.finding_type in {FindingType.CONTRADICTED_BEHAVIOR, FindingType.SCOPE_VIOLATION} and finding.support_level == FindingSupportLevel.GRAPH_BACKED,
         required_supporting_edge_ids=finding.supporting_edge_ids,
     )
     if not core_validation.passed:
@@ -234,7 +179,7 @@ def validate_witness(
         judgments_by_id,
         certificates_by_id,
         projection_edges_by_id,
-        require_projection_edge=finding.support_level == FindingSupportLevel.GRAPH_BACKED,
+        require_projection_edge=finding.finding_type in {FindingType.CONTRADICTED_BEHAVIOR, FindingType.SCOPE_VIOLATION} and finding.support_level == FindingSupportLevel.GRAPH_BACKED,
         required_supporting_edge_ids=finding.supporting_edge_ids,
     )
     if reducibility_failure is not None:
@@ -244,6 +189,7 @@ def validate_witness(
             failure_reason=reducibility_failure,
             checked_anchor_ids=list(witness.anchor_ids),
             checked_certificate_ids=list(witness.certificate_ids),
+            mechanical_revalidation_passed=True,
         )
 
     return WitnessValidation(
@@ -251,6 +197,8 @@ def validate_witness(
         passed=True,
         checked_anchor_ids=list(witness.anchor_ids),
         checked_certificate_ids=list(witness.certificate_ids),
+        mechanical_revalidation_passed=True,
+        operational_irreducibility_passed=True,
     )
 
 
@@ -265,8 +213,7 @@ def _validate_witness_core(
 ) -> WitnessValidation:
     """Validate the non-reducibility constraints for a witness."""
     included_ids = (
-        set(witness.anchor_ids)
-        | set(witness.fact_node_ids)
+        set(witness.fact_node_ids)
         | set(witness.judgment_ids)
         | set(witness.certificate_ids)
     )
@@ -337,7 +284,7 @@ def _validate_witness_core(
                     checked_anchor_ids=list(witness.anchor_ids),
                     checked_certificate_ids=list(witness.certificate_ids),
                 )
-        for fact_ref in judgment.subject_refs:
+        for fact_ref in [*judgment.subject_refs, *judgment.evidence_refs]:
             if fact_ref not in witness.fact_node_ids and fact_ref not in witness.anchor_ids:
                 return WitnessValidation(
                     witness_id=witness.witness_id,
@@ -349,7 +296,7 @@ def _validate_witness_core(
 
     for certificate_id in witness.certificate_ids:
         certificate = certificates_by_id[certificate_id]
-        for fact_ref in certificate.subject_refs:
+        for fact_ref in [*certificate.subject_refs, *certificate.evidence_refs]:
             if fact_ref not in witness.fact_node_ids and fact_ref not in witness.anchor_ids:
                 return WitnessValidation(
                     witness_id=witness.witness_id,
@@ -908,177 +855,144 @@ def _build_anchor_ids(finding: Finding, certificate_ids: list[str]) -> list[str]
     return list(dict.fromkeys(anchor for anchor in anchors if anchor))
 
 
-def _rank_tuple(
-    *,
-    fact_count: int,
-    judgment_count: int,
-    certificate_count: int,
-    uncertainty_mass: int,
-    projection_edge_count: int,
-) -> tuple[int, int, int, int, int]:
-    return (
-        fact_count,
-        judgment_count,
-        certificate_count,
-        uncertainty_mass,
-        projection_edge_count,
-    )
+def _make_witness(witness_id, finding, neighborhood, exact):
+    return Witness(witness_id=witness_id, finding_id=finding.finding_id,
+                   anchor_ids=list(neighborhood.anchor_ids),
+                   fact_node_ids=sorted(set(neighborhood.fact_node_ids) - set(neighborhood.certificate_ids)
+                                        - set(neighborhood.judgment_ids)),
+                   judgment_ids=list(neighborhood.judgment_ids), certificate_ids=list(neighborhood.certificate_ids),
+                   projection_edge_ids=list(neighborhood.projection_edge_ids), is_exact=exact)
 
 
-def _exact_search_witness(
-    *,
-    witness_id: str,
-    finding: Finding,
-    neighborhood: ProofNeighborhood,
-    judgments_by_id: dict[str, ReconciliationJudgment],
-    certificates_by_id: dict[str, Certificate],
-    projection_edges_by_id: dict[str, ReconciliationEdge],
-) -> Witness:
-    anchor_set = set(neighborhood.anchor_ids)
-    optional_fact_ids = [
-        fact_id for fact_id in neighborhood.fact_node_ids if fact_id not in anchor_set
-    ]
-    optional_edge_ids = list(neighborhood.projection_edge_ids)
-    best: Witness | None = None
-    best_rank: tuple[int | float, ...] | None = None
-
-    for fact_count in range(len(optional_fact_ids) + 1):
-        for fact_subset in combinations(optional_fact_ids, fact_count):
-            fact_node_ids = sorted(fact_subset)
-            for edge_count in range(len(optional_edge_ids) + 1):
-                for edge_subset in combinations(optional_edge_ids, edge_count):
-                    candidate = Witness(
-                        witness_id=witness_id,
-                        finding_id=finding.finding_id,
-                        anchor_ids=list(neighborhood.anchor_ids),
-                        fact_node_ids=fact_node_ids,
-                        judgment_ids=list(neighborhood.judgment_ids),
-                        certificate_ids=list(neighborhood.certificate_ids),
-                        projection_edge_ids=list(edge_subset),
-                        rank_tuple=_rank_tuple(
-                            fact_count=len(fact_node_ids),
-                            judgment_count=len(neighborhood.judgment_ids),
-                            certificate_count=len(neighborhood.certificate_ids),
-                            uncertainty_mass=sum(
-                                1
-                                for judgment_id in neighborhood.judgment_ids
-                                if judgments_by_id[judgment_id].result.value == "abstain"
-                            ),
-                            projection_edge_count=len(edge_subset),
-                        ),
-                        is_exact=True,
-                    )
-                    validation = validate_witness(
-                        finding,
-                        candidate,
-                        judgments_by_id,
-                        certificates_by_id,
-                        projection_edges_by_id,
-                    )
-                    if not validation.passed:
-                        continue
-                    if best_rank is None or candidate.rank_tuple < best_rank:
-                        best = candidate
-                        best_rank = candidate.rank_tuple
-        if best is not None:
-            break
-
-    if best is None:
-        return _greedy_witness(
-            witness_id=witness_id,
-            finding=finding,
-            neighborhood=neighborhood,
-            judgments_by_id=judgments_by_id,
-            certificates_by_id=certificates_by_id,
-            projection_edges_by_id=projection_edges_by_id,
-        )
-    return best
+def _proof_edges(witness, judgments, certificates, projections):
+    """Premise edges are forced by retained proof nodes; projection relations are optional."""
+    edges = set()
+    for identifier in witness.judgment_ids:
+        j = judgments[identifier]
+        edges.update((ref, identifier, "premise") for ref in j.premise_judgment_ids)
+        edges.update((ref, identifier, "fact") for ref in [*j.subject_refs, *j.evidence_refs])
+    for identifier in witness.certificate_ids:
+        c = certificates[identifier]
+        edges.update((ref, identifier, "premise") for ref in c.supporting_judgment_ids)
+        edges.update((ref, identifier, "fact") for ref in [*c.subject_refs, *c.evidence_refs])
+    for identifier in witness.projection_edge_ids:
+        edge = projections[identifier]
+        endpoints = tuple(ref for ref in [edge.clause_id, edge.constraint_id, edge.step_id,
+                         edge.code_unit_id, edge.event_id, edge.resource_id, edge.path_id] if ref)
+        edges.add((repr(endpoints), identifier, edge.relation.value))
+    return edges
 
 
-def _greedy_witness(
-    *,
-    witness_id: str,
-    finding: Finding,
-    neighborhood: ProofNeighborhood,
-    judgments_by_id: dict[str, ReconciliationJudgment],
-    certificates_by_id: dict[str, Certificate],
-    projection_edges_by_id: dict[str, ReconciliationEdge],
-) -> Witness:
-    anchor_set = set(neighborhood.anchor_ids)
-    fact_node_ids = [
-        fact_id
-        for fact_id in dict.fromkeys(neighborhood.fact_node_ids)
-        if fact_id not in anchor_set
-    ]
-    edge_ids = list(neighborhood.projection_edge_ids)
+def _graph_objective(witness, judgments, certificates, projections):
+    nodes = set(witness.fact_node_ids) | set(witness.judgment_ids) | set(witness.certificate_ids)
+    edges = _proof_edges(witness, judgments, certificates, projections)
+    return len(nodes), len(edges), tuple(sorted(nodes)) + tuple(sorted(map(repr, edges)))
 
-    for fact_id in list(fact_node_ids):
-        if fact_id in anchor_set:
+
+def _feasible(finding, witness, judgments, certificates, projections):
+    return _candidate_witness_still_valid(finding, witness, judgments, certificates, projections,
+        require_projection_edge=finding.finding_type in {FindingType.CONTRADICTED_BEHAVIOR,
+        FindingType.SCOPE_VIOLATION} and finding.support_level == FindingSupportLevel.GRAPH_BACKED,
+        required_supporting_edge_ids=finding.supporting_edge_ids)
+
+
+def _elements(witness):
+    anchors = set(witness.anchor_ids)
+    return [(field, item) for field in ("fact_node_ids", "judgment_ids", "certificate_ids", "projection_edge_ids")
+            for item in getattr(witness, field) if item not in anchors]
+
+
+def _delete(witness, field, identifier):
+    return witness.model_copy(update={field: [item for item in getattr(witness, field) if item != identifier]})
+
+
+def _canonical_topological_elements(witness, judgments, certificates):
+    elements = _elements(witness)
+    fields = {identifier: field for field, identifier in elements}
+    incoming = {identifier: set() for identifier in fields}
+    outgoing = {identifier: set() for identifier in fields}
+    for identifier in witness.judgment_ids:
+        j = judgments[identifier]
+        for ref in [*j.premise_judgment_ids, *j.subject_refs, *j.evidence_refs]:
+            if ref in fields and identifier in fields:
+                incoming[identifier].add(ref)
+                outgoing[ref].add(identifier)
+    for identifier in witness.certificate_ids:
+        c = certificates[identifier]
+        for ref in [*c.supporting_judgment_ids, *c.subject_refs, *c.evidence_refs]:
+            if ref in fields and identifier in fields:
+                incoming[identifier].add(ref)
+                outgoing[ref].add(identifier)
+    ready = sorted(identifier for identifier in fields if not incoming[identifier])
+    heapq.heapify(ready)
+    order = []
+    while ready:
+        identifier = heapq.heappop(ready)
+        order.append((fields[identifier], identifier))
+        for target in sorted(outgoing[identifier]):
+            incoming[target].remove(identifier)
+            if not incoming[target]:
+                heapq.heappush(ready, target)
+    if len(order) != len(fields):
+        raise ValueError("Cyclic proof premises cannot be topologically pruned")
+    return order
+
+
+def _exact_search_witness(*, witness_id, finding, neighborhood, judgments_by_id,
+                          certificates_by_id, projection_edges_by_id):
+    whole = _make_witness(witness_id, finding, neighborhood, True)
+    # Fixed certificate closure is mandatory in every feasible subgraph. This eliminates
+    # impossible subsets without changing exhaustive minimization over the feasible set.
+    forced = set(whole.anchor_ids)
+    pending = list(whole.certificate_ids)
+    while pending:
+        identifier = pending.pop()
+        proof = certificates_by_id.get(identifier) or judgments_by_id.get(identifier)
+        if proof is None:
             continue
-        candidate_facts = [item for item in fact_node_ids if item != fact_id]
-        candidate = Witness(
-            witness_id=witness_id,
-            finding_id=finding.finding_id,
-            anchor_ids=list(neighborhood.anchor_ids),
-            fact_node_ids=candidate_facts,
-            judgment_ids=list(neighborhood.judgment_ids),
-            certificate_ids=list(neighborhood.certificate_ids),
-            projection_edge_ids=list(edge_ids),
-            rank_tuple=(),
-            is_exact=False,
-        )
-        if validate_witness(
-            finding,
-            candidate,
-            judgments_by_id,
-            certificates_by_id,
-            projection_edges_by_id,
-        ).passed:
-            fact_node_ids = candidate_facts
+        premises = getattr(proof, "supporting_judgment_ids", getattr(proof, "premise_judgment_ids", []))
+        for ref in [*premises, *proof.subject_refs, *proof.evidence_refs]:
+            if ref not in forced:
+                forced.add(ref)
+                pending.append(ref)
+    optional_nodes = [(field, identifier) for field, identifier in _elements(whole)
+                      if field != "projection_edge_ids" and identifier not in forced]
+    optional_edges = sorted(whole.projection_edge_ids)
+    for node_count in range(len(optional_nodes) + 1):
+        best = None
+        best_rank = None
+        for selected_nodes in combinations(optional_nodes, node_count):
+            selected = forced | {identifier for _, identifier in selected_nodes}
+            base = whole.model_copy(update={field: [item for item in getattr(whole, field) if item in selected]
+                               for field in ("fact_node_ids", "judgment_ids", "certificate_ids")})
+            for edge_count in range(len(optional_edges) + 1):
+                found_at_edge_count = False
+                for selected_edges in combinations(optional_edges, edge_count):
+                    candidate = base.model_copy(update={"projection_edge_ids": list(selected_edges)})
+                    if not _feasible(finding, candidate, judgments_by_id, certificates_by_id, projection_edges_by_id):
+                        continue
+                    rank = _graph_objective(candidate, judgments_by_id, certificates_by_id, projection_edges_by_id)
+                    if best_rank is None or rank < best_rank:
+                        best, best_rank = candidate, rank
+                    found_at_edge_count = True
+                if found_at_edge_count:
+                    break
+        if best is not None:
+            return best
+    # Algorithm B1 lines 5--6: keep the rejected exact candidate for diagnosis.
+    return whole
 
-    for edge_id in list(edge_ids):
-        candidate_edges = [item for item in edge_ids if item != edge_id]
-        candidate = Witness(
-            witness_id=witness_id,
-            finding_id=finding.finding_id,
-            anchor_ids=list(neighborhood.anchor_ids),
-            fact_node_ids=list(fact_node_ids),
-            judgment_ids=list(neighborhood.judgment_ids),
-            certificate_ids=list(neighborhood.certificate_ids),
-            projection_edge_ids=candidate_edges,
-            rank_tuple=(),
-            is_exact=False,
-        )
-        if validate_witness(
-            finding,
-            candidate,
-            judgments_by_id,
-            certificates_by_id,
-            projection_edges_by_id,
-        ).passed:
-            edge_ids = candidate_edges
 
-    return Witness(
-        witness_id=witness_id,
-        finding_id=finding.finding_id,
-        anchor_ids=list(neighborhood.anchor_ids),
-        fact_node_ids=sorted(fact_node_ids),
-        judgment_ids=list(neighborhood.judgment_ids),
-        certificate_ids=list(neighborhood.certificate_ids),
-        projection_edge_ids=sorted(edge_ids),
-        rank_tuple=_rank_tuple(
-            fact_count=len(fact_node_ids),
-            judgment_count=len(neighborhood.judgment_ids),
-            certificate_count=len(neighborhood.certificate_ids),
-            uncertainty_mass=sum(
-                1
-                for judgment_id in neighborhood.judgment_ids
-                if judgments_by_id[judgment_id].result.value == "abstain"
-            ),
-            projection_edge_count=len(edge_ids),
-        ),
-        is_exact=False,
-    )
+def _greedy_witness(*, witness_id, finding, neighborhood, judgments_by_id,
+                    certificates_by_id, projection_edges_by_id):
+    witness = _make_witness(witness_id, finding, neighborhood, False)
+    for field, identifier in _canonical_topological_elements(witness, judgments_by_id, certificates_by_id):
+        candidate = _delete(witness, field, identifier)
+        if _feasible(finding, candidate, judgments_by_id, certificates_by_id, projection_edges_by_id):
+            witness = candidate
+    # No second pruning pass: validate_witness tests the frozen result and rejects
+    # any remaining removable element, as Algorithm B1 lines 17--25 require.
+    return witness
 
 
 def _is_connected(
@@ -1110,7 +1024,7 @@ def _is_connected(
             continue
         for judgment_id in certificate.supporting_judgment_ids:
             connect(certificate_id, judgment_id)
-        for fact_ref in certificate.subject_refs:
+        for fact_ref in [*certificate.subject_refs, *certificate.evidence_refs]:
             connect(certificate_id, fact_ref)
 
     for judgment_id in witness.judgment_ids:
@@ -1119,7 +1033,7 @@ def _is_connected(
             continue
         for premise_id in judgment.premise_judgment_ids:
             connect(judgment_id, premise_id)
-        for fact_ref in judgment.subject_refs:
+        for fact_ref in [*judgment.subject_refs, *judgment.evidence_refs]:
             connect(judgment_id, fact_ref)
 
     for edge_id in witness.projection_edge_ids:

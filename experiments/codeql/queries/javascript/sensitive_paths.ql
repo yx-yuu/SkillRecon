@@ -8,6 +8,7 @@
  */
 
 import javascript
+import SkillReconExecution
 import semmle.javascript.dataflow.DataFlow
 import semmle.javascript.dataflow.TaintTracking
 import semmle.javascript.frameworks.WebSocket
@@ -34,7 +35,7 @@ predicate isFileSource(DataFlow::Node source) {
 
 predicate isShellSink(DataFlow::Node sink) {
   exists(SystemCommandExecution exec |
-    sink = exec.getACommandArgument()
+    skillReconExecutionInput(exec, sink)
   )
 }
 
@@ -92,7 +93,9 @@ predicate getSourceCapability(DataFlow::Node source, string capType) {
 predicate getSinkCapability(DataFlow::Node sink, string capType) {
   isWebSocketSink(sink) and capType = "websocket"
   or
-  isShellSink(sink) and capType = "shell_exec"
+  exists(SystemCommandExecution exec |
+    skillReconExecutionInput(exec, sink) and capType = skillReconExecutionCapability(exec)
+  )
   or
   isFileWriteSink(sink) and capType = "file_write"
   or
@@ -102,13 +105,51 @@ predicate getSinkCapability(DataFlow::Node sink, string capType) {
 string getEnvSourceSymbolHint(DataFlow::Node source) {
   result = source.asExpr().(PropAccess).getPropertyName()
   or
+  not exists(source.asExpr().(PropAccess).getPropertyName()) and
   result = ""
 }
 
 string getSimpleNodeSymbolHint(DataFlow::Node node) {
   result = node.asExpr().(VarAccess).getName()
   or
+  not exists(node.asExpr().(VarAccess).getName()) and
   result = ""
+}
+
+string getNodeSite(DataFlow::Node node) {
+  result = node.getLocation().getFile().getRelativePath() + ":" +
+    node.getLocation().getStartLine().toString() + ":" +
+    node.getLocation().getStartColumn().toString()
+}
+
+string getSourceOperationSite(DataFlow::Node source, string cap) {
+  cap = "env_var_read" and result = getNodeSite(source)
+  or
+  cap = "file_read" and
+  exists(FileSystemReadAccess read |
+    source = read.getADataNode().getALocalSource() and result = getNodeSite(read)
+  )
+}
+
+string getSinkOperationSite(DataFlow::Node sink, string cap) {
+  exists(SystemCommandExecution exec |
+    skillReconExecutionInput(exec, sink) and cap = skillReconExecutionCapability(exec) and
+    result = getNodeSite(exec)
+  )
+  or
+  cap = "file_write" and
+  exists(FileSystemWriteAccess write | sink = write.getADataNode() and result = getNodeSite(write))
+  or
+  cap = "http_request" and
+  exists(ClientRequest request |
+    not request instanceof ClientWebSocket::ClientSocket and
+    (sink = request.getUrl() or sink = request.getADataNode()) and result = getNodeSite(request)
+  )
+  or
+  cap = "websocket" and
+  exists(ClientWebSocket::ClientSocket socket |
+    (sink = socket.getUrl() or sink = socket.getADataNode()) and result = getNodeSite(socket)
+  )
 }
 
 module SkillReconPathConfig implements DataFlow::ConfigSig {
@@ -144,4 +185,8 @@ select sink.getNode(), source, sink,
     " | pathSink=" + sinkCap +
     " | sinkSlotKind=" + sinkSlotKind +
     " | sinkSymbolHint=" + sinkSymbolHint +
+    " | sourceSite=" + getNodeSite(source.getNode()) +
+    " | sinkSite=" + getNodeSite(sink.getNode()) +
+    " | sourceOperationSite=" + getSourceOperationSite(source.getNode(), sourceCap) +
+    " | sinkOperationSite=" + getSinkOperationSite(sink.getNode(), sinkCap) +
     " | pathKind=codeql:javascript:" + sourceCap + "->" + sinkCap

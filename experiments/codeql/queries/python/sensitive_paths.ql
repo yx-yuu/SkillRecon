@@ -13,6 +13,9 @@ import semmle.python.Concepts
 import semmle.python.ApiGraphs
 import semmle.python.dataflow.new.DataFlow
 import semmle.python.dataflow.new.TaintTracking
+import SkillReconPathlib
+import SkillReconFileIO
+import SkillReconExecution
 
 predicate isEnvSource(DataFlow::Node source) {
   exists(API::CallNode call |
@@ -28,7 +31,7 @@ predicate isEnvSource(DataFlow::Node source) {
   or
   exists(API::Node sub |
     sub = API::moduleImport("os").getMember("environ").getASubscript() and
-    source = sub.asSink()
+    source = sub.asSource()
   )
 }
 
@@ -40,9 +43,11 @@ predicate getSourceSlotKind(DataFlow::Node source, string slotKind) {
 
 predicate isFileSource(DataFlow::Node source) {
   exists(FileSystemAccess access |
-    not access instanceof FileSystemWriteAccess and
+    skillReconReadAccess(access) and
     source = access
   )
+  or
+  skillReconPathlibRead(source)
 }
 
 predicate isShellSink(DataFlow::Node sink) {
@@ -57,8 +62,8 @@ predicate isFileWriteSink(DataFlow::Node sink) {
   )
 }
 
-predicate isHttpBodySink(DataFlow::Node sink) {
-  exists(API::CallNode call, string methodName |
+predicate httpBodyCall(API::CallNode call, DataFlow::Node sink) {
+  exists(string methodName |
     methodName in [Http::httpVerbLower(), "request"] and
     (
       call = API::moduleImport("requests").getMember(methodName).getACall()
@@ -67,7 +72,7 @@ predicate isHttpBodySink(DataFlow::Node sink) {
     ) and
     (
       exists(string argName |
-        argName in ["data", "json", "content", "body", "params"] and
+        argName in ["data", "json", "content", "body", "params", "headers"] and
         sink = call.getArgByName(argName)
       )
       or
@@ -77,6 +82,8 @@ predicate isHttpBodySink(DataFlow::Node sink) {
     )
   )
 }
+
+predicate isHttpBodySink(DataFlow::Node sink) { httpBodyCall(_, sink) }
 
 predicate isHttpUrlSink(DataFlow::Node sink) {
   exists(Http::Client::Request request |
@@ -101,7 +108,9 @@ predicate getSourceCapability(DataFlow::Node source, string capType) {
 }
 
 predicate getSinkCapability(DataFlow::Node sink, string capType) {
-  isShellSink(sink) and capType = "shell_exec"
+  exists(SystemCommandExecution exec |
+    sink = exec.getCommand() and capType = skillReconExecutionCapability(exec)
+  )
   or
   isFileWriteSink(sink) and capType = "file_write"
   or
@@ -111,31 +120,69 @@ predicate getSinkCapability(DataFlow::Node sink, string capType) {
 string getSimpleNodeSymbolHint(DataFlow::Node node) {
   result = node.asExpr().(Name).getId()
   or
+  not exists(node.asExpr().(Name).getId()) and
   result = ""
 }
 
-string getAssignedSymbolHint(DataFlow::Node node) {
+predicate assignedSymbolHint(DataFlow::Node node, string hint) {
   exists(AssignStmt assign, Name lhs |
     assign.getValue() = node.asExpr() and
     assign.getATarget() = lhs and
     not exists(Expr other | assign.getATarget() = other and other != lhs) and
-    result = lhs.getId()
+    hint = lhs.getId()
   )
   or
   exists(AssignStmt assign, Name lhs |
     assign.getValue().getAFlowNode() = node.asCfgNode() and
     assign.getATarget() = lhs and
     not exists(Expr other | assign.getATarget() = other and other != lhs) and
-    result = lhs.getId()
+    hint = lhs.getId()
   )
+}
+
+string getAssignedSymbolHint(DataFlow::Node node) {
+  assignedSymbolHint(node, result)
   or
+  not exists(string hint | assignedSymbolHint(node, hint)) and
   result = ""
+}
+
+string getNodeSite(DataFlow::Node node) {
+  result = node.getLocation().getFile().getRelativePath() + ":" +
+    node.getLocation().getStartLine().toString() + ":" +
+    node.getLocation().getStartColumn().toString()
+}
+
+string getSinkOperationSite(DataFlow::Node sink, string cap) {
+  cap in ["shell_exec", "subprocess"] and
+  exists(SystemCommandExecution exec | sink = exec.getCommand() and result = getNodeSite(exec))
+  or
+  cap = "file_write" and
+  exists(FileSystemWriteAccess write | sink = write.getADataNode() and result = getNodeSite(write))
+  or
+  cap = "http_request" and
+  (
+    exists(API::CallNode call | httpBodyCall(call, sink) and result = getNodeSite(call))
+    or
+    exists(Http::Client::Request request | sink = request.getAUrlPart() and result = getNodeSite(request))
+  )
 }
 
 module SkillReconPathConfig implements DataFlow::ConfigSig {
   predicate isSource(DataFlow::Node source) { getSourceCapability(source, _) }
 
   predicate isSink(DataFlow::Node sink) { getSinkCapability(sink, _) }
+
+  // Authorization ordering follows derived values, including fingerprints.
+  // A digest is a dependency on its input; this does not assert reversibility
+  // or that the original token bytes are disclosed.
+  predicate isAdditionalFlowStep(DataFlow::Node input, DataFlow::Node output) {
+    exists(API::CallNode hash, API::CallNode digest |
+      hash = API::moduleImport("hashlib").getMember("sha256").getACall() and
+      digest = hash.getReturn().getMember(["digest", "hexdigest"]).getACall() and
+      input = hash.getArg(0) and output = digest
+    )
+  }
 }
 
 module SkillReconPathFlow = TaintTracking::Global<SkillReconPathConfig>;
@@ -165,4 +212,8 @@ select sink.getNode(), source, sink,
     " | pathSink=" + sinkCap +
     " | sinkSlotKind=" + sinkSlotKind +
     " | sinkSymbolHint=" + sinkSymbolHint +
+    " | sourceSite=" + getNodeSite(source.getNode()) +
+    " | sinkSite=" + getNodeSite(sink.getNode()) +
+    " | sourceOperationSite=" + getNodeSite(source.getNode()) +
+    " | sinkOperationSite=" + getSinkOperationSite(sink.getNode(), sinkCap) +
     " | pathKind=codeql:python:" + sourceCap + "->" + sinkCap

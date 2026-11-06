@@ -80,6 +80,7 @@ class CodeUnit(BaseModel):
     source_doc_id: str | None = None
     source_block_id: str | None = None
     source_offset: int | None = None
+    source_pointer: str | None = None
     heading_context: str | None = None
     binding_instruction: str | None = None
 
@@ -165,6 +166,8 @@ class EvidenceSpan(BaseModel):
     start_offset: int
     end_offset: int
     text: str
+    start_byte: int | None = None
+    end_byte: int | None = None
 
 
 class Constraint(BaseModel):
@@ -193,6 +196,7 @@ class Clause(BaseModel):
     vote_agreement: float = 0.0
     step_ids: list[str] = []
     source_doc_ids: list[str] = []
+    bound_event_ids: list[str] = []
 
 
 class Step(BaseModel):
@@ -209,6 +213,11 @@ class Step(BaseModel):
     block_ids: list[str] = []
     heading_context: str = ""
     evidence: EvidenceSpan | None = None
+    exec_bound: bool = False
+    start_byte: int | None = None
+    end_byte: int | None = None
+    document_path: str | None = None
+    unresolved_order: bool = False
 
 
 class StepOrderEdge(BaseModel):
@@ -236,6 +245,7 @@ class ClauseSample(BaseModel):
     operator: ClauseOperator
     target: str | None = None
     constraint: str | None = None
+    constraints: list[str] = []
     evidence_span: str
     confidence_note: str
 
@@ -274,6 +284,7 @@ class CapabilityEvent(BaseModel):
     file_path: str = ""
     line: int = 0
     detail: str = ""
+    analysis_tier: int = 0
 
 
 class ResourceUse(BaseModel):
@@ -290,6 +301,7 @@ class ResourceUse(BaseModel):
     location: str = ""
     origin_kind: str = "unknown"
     origin_hint: str = ""
+    context: str = ""
 
 
 class Bridge(BaseModel):
@@ -304,6 +316,10 @@ class Bridge(BaseModel):
     evidence: str = ""
     source_event_id: str | None = None
     target_event_id: str | None = None
+    cli_arguments: list[str] = []
+    cli_argument_resolved: list[bool] = []
+    environment: dict[str, str] = {}
+    environment_resolved: dict[str, bool] = {}
 
 
 class OrchestrationHypothesis(BaseModel):
@@ -330,6 +346,7 @@ class PathSegment(BaseModel):
     slot_kind: str = ""
     symbol_hint: str = ""
     expr_hint: str = ""
+    resource_ids: list[str] = []
 
 
 class RiskPath(BaseModel):
@@ -447,6 +464,7 @@ class ReconciliationEdge(BaseModel):
     event_id: str | None = None
     path_id: str | None = None
     resource_id: str | None = None
+    binding_resource_id: str | None = None
     predicate_satisfied: bool = True
     source_judgment_ids: list[str] = []
     candidate_sources: list[CandidateSource] = []
@@ -638,9 +656,17 @@ class Witness(BaseModel):
     judgment_ids: list[str] = []
     certificate_ids: list[str] = []
     projection_edge_ids: list[str] = []
+    graph_edge_ids: list[str] = []
+    evidence_graph: dict[str, object] = {}
+    search_seconds: float | None = None
+    acceptance_seconds: float | None = None
+    feasibility_checks: int = 0
     rank_tuple: tuple[int | float, ...] = ()
     is_exact: bool = False
     revalidation_passed: bool = False
+    lex_id: str = ""
+    neighborhood_nodes: int = 0
+    neighborhood_edges: int = 0
 
 
 class WitnessContextLink(BaseModel):
@@ -680,6 +706,8 @@ class WitnessValidation(BaseModel):
     failure_reason: str | None = None
     checked_anchor_ids: list[str] = []
     checked_certificate_ids: list[str] = []
+    mechanical_revalidation_passed: bool = False
+    operational_irreducibility_passed: bool = False
 
 
 class PermissionManifestEntry(BaseModel):
@@ -808,6 +836,11 @@ class DocBlock(BaseModel):
     end_offset: int
     heading_context: str = ""
     language_hint: str = ""
+    start_byte: int | None = None
+    end_byte: int | None = None
+    table_headers: list[str] = []
+    table_cells: list[str] = []
+    source_text: str = ""
 
 
 class DocumentPack(BaseModel):

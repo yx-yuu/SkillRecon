@@ -56,18 +56,28 @@ def normalize_language(hint: str) -> str:
 
 
 _BINDING_KEYWORDS_ZH = re.compile(
-    r"复制|执行|运行|输出|保存|写入|查阅|读取|调用|使用以下模板|使用下面模板",
+    r"(?:^|[，。；:：]\s*)(?:请|先|然后|接着|务必|直接|立即|需要|必须|可以|应当)?"
+    r"(?:(?:执行|运行|安装|调用)(?!后|前|时|的|结果|返回)|使用(?:以下|此|该)?(?:命令|脚本))",
 )
 _BINDING_KEYWORDS_EN = re.compile(
-    r"(?i)\bcopy\b|\bexecute\b|\brun\b|\boutput\b|\bsave\b"
-    r"|\bwrite\b|\bwrite_file\b|\bread\b|\binvoke\b|\buse\s+template\b",
+    r"(?i)(?:^|[,;:.]\s*)(?:please\s+|then\s+|next\s+|first\s+|now\s+|you\s+(?:must|should|can)\s+)?"
+    r"(?:(?:execute|run|install|invoke)\b|use\s+(?:the\s+)?(?:following\s+)?(?:command|script)\b)",
 )
 _HEADING_POSITIVE = re.compile(r"(?i)模板|template|脚本|script|代码|code")
 _HEADING_NEGATIVE = re.compile(r"(?i)示例|example|schema|规范|spec")
+_PROHIBITIVE_BINDING = re.compile(r"(?i)^(?:please\s+)?(?:do not\b|don't\b|must not\b|never\b|禁止|不得|不要|切勿)")
+
+
+def is_prohibitive_binding(text: str) -> bool:
+    """A prohibition introduces a constraint, rather than an execution request."""
+    text = re.sub(r'^(?:(?:[-+*]|\d+[.)]|>)\s+)+','',text.strip())
+    return bool(_PROHIBITIVE_BINDING.search(text.lstrip('*_ ')))
 
 
 def has_binding_keyword(text: str) -> bool:
     """Return whether prose contains an operational binding cue."""
+    text = re.sub(r'^(?:(?:[-+*]|\d+[.)]|>)\s+)+','',text.strip())
+    text = re.sub(r'[*_]','',text)
     return bool(_BINDING_KEYWORDS_ZH.search(text) or _BINDING_KEYWORDS_EN.search(text))
 
 
@@ -76,16 +86,11 @@ def check_binding_signal(
     code_block: DocBlock,
 ) -> str | None:
     """Return the instruction text that binds a code block, if any."""
-    if _HEADING_NEGATIVE.search(code_block.heading_context):
-        return None
-
-    if preceding_block is not None and preceding_block.block_type in {"paragraph", "list_item"}:
+    if (preceding_block is not None and preceding_block.doc_id == code_block.doc_id
+            and preceding_block.block_type in {"paragraph", "list_item"}):
         text = preceding_block.content
-        if has_binding_keyword(text):
+        if not is_prohibitive_binding(text) and has_binding_keyword(text):
             return text
-
-    if _HEADING_POSITIVE.search(code_block.heading_context):
-        return f"[heading] {code_block.heading_context}"
 
     return None
 

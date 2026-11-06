@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
-from collections import defaultdict
+from collections import Counter, defaultdict
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 
 from skillrecon.behavior.normalize_helpers import _normalize_relpath, _read_source_line
 from skillrecon.behavior.normalize_types import RawObservation, RawPathResult
+from skillrecon.behavior.resource_extract import _extract_resources
+from skillrecon.behavior.bridge_calls import recover_source_bridges, resolve_js_import
 from skillrecon.core.enums import BridgeKind
 from skillrecon.core.sensitivity import event_requires_authorization
 from skillrecon.core.types import (
@@ -48,10 +51,10 @@ _SINK_CAPABILITIES = {
     "websocket",
     "smtp_send",
     "ssh_connect",
-    "data_encode_send",
+    "data_encode",
     "file_write",
     "shell_exec",
-    "subprocess_spawn",
+    "subprocess",
 }
 
 _NETWORK_CAPABILITIES = {
@@ -59,8 +62,8 @@ _NETWORK_CAPABILITIES = {
     "websocket",
     "smtp_send",
     "ssh_connect",
-    "data_encode_send",
-    "dns_lookup",
+    "data_encode",
+    "dns_query",
     "socket_connect",
     "ftp_transfer",
 }
@@ -75,7 +78,7 @@ _FILESYSTEM_CAPABILITIES = {
 }
 _PROCESS_CAPABILITIES = {
     "shell_exec",
-    "subprocess_spawn",
+    "subprocess",
     "dynamic_import",
     "process_kill",
 }
@@ -95,7 +98,8 @@ def detect_bridges(
     staged_root: Path,
 ) -> list[Bridge]:
     """Recover static, command, and artifact bridges across code units."""
-    bridges: dict[tuple[str, str, BridgeKind, str], Bridge] = {}
+    source_bridges = recover_source_bridges(unit_paths, events, resources, staged_root)
+    bridges: dict[tuple[str, ...], Bridge] = {}
     unit_by_path = {
         _normalize_relpath(relative_path): unit_id
         for unit_id, relative_path in unit_paths.items()
@@ -127,41 +131,19 @@ def detect_bridges(
     for event in events:
         events_by_unit[event.unit_id].append(event)
 
-    known_paths = sorted(unit_paths.items(), key=lambda item: len(item[1]), reverse=True)
-    for unit_id, unit_events in events_by_unit.items():
-        for event in unit_events:
-            if event.capability not in {"shell_exec", "subprocess_spawn"}:
-                continue
-            line_text = _read_source_line(staged_root, event.file_path, event.line)
-            for target_unit_id, relative_path in known_paths:
-                if target_unit_id == unit_id:
-                    continue
-                basename = PurePosixPath(relative_path).name
-                if relative_path in line_text or basename in line_text:
-                    evidence = f"command references {relative_path} at {event.location}"
-                    key = (unit_id, target_unit_id, BridgeKind.COMMAND, evidence)
-                    bridges[key] = Bridge(
-                        bridge_id=f"b{len(bridges)}",
-                        source_unit_id=unit_id,
-                        target_unit_id=target_unit_id,
-                        kind=BridgeKind.COMMAND,
-                        evidence=evidence,
-                        source_event_id=event.event_id,
-                    )
-
     event_by_id = {event.event_id: event for event in events}
     writes: dict[str, list[tuple[str, str]]] = defaultdict(list)
     reads: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for resource in resources:
-        if resource.resource_type != "path" or resource.event_id is None:
+        if resource.resource_type != "path" or resource.event_id is None or not resource.resolved:
             continue
         matched_event = event_by_id.get(resource.event_id)
         if matched_event is None:
             continue
         if matched_event.capability == "file_write":
-            writes[resource.value].append((resource.unit_id, matched_event.event_id))
+            writes[posixpath.normpath(resource.value)].append((resource.unit_id, matched_event.event_id))
         elif matched_event.capability == "file_read":
-            reads[resource.value].append((resource.unit_id, matched_event.event_id))
+            reads[posixpath.normpath(resource.value)].append((resource.unit_id, matched_event.event_id))
 
     for path_value, write_units in writes.items():
         for source_unit, source_event_id in write_units:
@@ -169,7 +151,8 @@ def detect_bridges(
                 if source_unit == target_unit:
                     continue
                 evidence = f"shared artifact {path_value}"
-                key = (source_unit, target_unit, BridgeKind.ARTIFACT, evidence)
+                key = (source_unit, target_unit, BridgeKind.ARTIFACT, evidence,
+                       source_event_id, target_event_id)
                 bridges[key] = Bridge(
                     bridge_id=f"b{len(bridges)}",
                     source_unit_id=source_unit,
@@ -180,7 +163,52 @@ def detect_bridges(
                     target_event_id=target_event_id,
                 )
 
-    return list(bridges.values())
+    for bridge in source_bridges:
+        location = bridge.evidence.split(' at ', 1)[1].split(';', 1)[0]
+        if any((old.source_unit_id, old.target_unit_id, old.kind) ==
+               (bridge.source_unit_id, bridge.target_unit_id, bridge.kind)
+               and f' at {location}' in old.evidence for old in bridges.values()):
+            continue
+        key = (bridge.source_unit_id, bridge.target_unit_id, bridge.kind, bridge.evidence)
+        bridges[key] = bridge.model_copy(update={'bridge_id': f'b{len(bridges)}'})
+    result = [bridge.model_copy(update={"bridge_id": f"b{index}"})
+              for index, bridge in enumerate(bridges.values())]
+    from skillrecon.behavior.propagation import recover_invocation_bindings
+    recover_invocation_bindings(unit_paths, events, resources, staged_root, result)
+    return result
+
+
+def _js_join_script_target(call_text: str, source_text: str, source_path: str) -> str | None:
+    """Resolve a const script argument built by an imported Node path.join."""
+    argument = re.search(
+        r"\(\s*['\"](?:bash|sh|python3?|node)['\"]\s*,\s*\[\s*([A-Za-z_$][\w$]*)\s*(?:,|\])",
+        call_text,
+    )
+    if argument is None:
+        return None
+    symbol = argument.group(1)
+    declarations = re.findall(
+        rf"\bconst\s+{re.escape(symbol)}\s*=\s*([A-Za-z_$][\w$]*)\(\s*__dirname\s*,([^;\n]+)\)\s*;",
+        source_text,
+    )
+    if len(declarations) != 1:
+        return None
+    join_name, raw_segments = declarations[0]
+    imported_names = set()
+    for names in re.findall(r"import\s*\{([^}]+)\}\s*from\s*['\"](?:node:)?path['\"]", source_text):
+        for item in names.split(","):
+            binding = re.fullmatch(r"\s*join(?:\s+as\s+([A-Za-z_$][\w$]*))?\s*", item)
+            if binding:
+                imported_names.add(binding.group(1) or "join")
+    if join_name not in imported_names:
+        return None
+    segments = []
+    for item in raw_segments.split(","):
+        literal = re.fullmatch(r"\s*(['\"])([^'\"]+)\1\s*", item)
+        if literal is None:
+            return None
+        segments.append(literal.group(2))
+    return posixpath.normpath("/".join([PurePosixPath(source_path).parent.as_posix(), *segments]))
 
 
 def build_risk_paths(
@@ -254,12 +282,17 @@ def build_risk_paths(
                     sink=_event_segment(sink),
                     segments=[_event_segment(source), _event_segment(sink)],
                     bridges_used=list(bridge_ids),
-                    evidence_level="bridge",
-                    path_kind=f"bridge:{sample_bridge.kind.value}",
+                    evidence_level="weak",
+                    path_kind=f"weak:bridge:{sample_bridge.kind.value}",
                 )
             )
 
     return paths
+
+
+def assign_path_ids(paths: list[RiskPath]) -> list[RiskPath]:
+    """Assign package-wide IDs after all path producers have been merged."""
+    return [path.model_copy(update={"path_id": f"p{index}"}) for index, path in enumerate(paths)]
 
 
 def attach_orchestration_hypotheses(
@@ -502,10 +535,10 @@ def normalize_codeql_paths(
     for unit_id, relative_path in unit_paths.items():
         path_to_units[_normalize_relpath(relative_path)].append(unit_id)
 
-    event_index: dict[tuple[str, int, str], CapabilityEvent] = {}
+    event_index: dict[tuple[str, int, str], list[CapabilityEvent]] = defaultdict(list)
     events_by_id: dict[str, CapabilityEvent] = {}
     for event in events:
-        event_index[(event.file_path, event.line, event.capability)] = event
+        event_index[(event.file_path, event.line, event.capability)].append(event)
         events_by_id[event.event_id] = event
 
     paths: list[RiskPath] = []
@@ -521,27 +554,39 @@ def normalize_codeql_paths(
 
         for index, step in enumerate(raw_path.steps):
             normalized_path = _normalize_relpath(step.relative_path)
+            endpoint = 'source' if index == 0 else 'sink' if index == len(raw_path.steps)-1 else None
+            binding_line = step.line
+            if endpoint and raw_path.fields.get(endpoint+'OperationSite'):
+                operation_file, operation_line, _ = raw_path.fields[endpoint+'OperationSite'].rsplit(':', 2)
+                normalized_path = _normalize_relpath(operation_file)
+                binding_line = int(operation_line)
             unit_ids = path_to_units.get(normalized_path)
             if not unit_ids:
                 continue
             unit_id = unit_ids[0]
-            location = f"{normalized_path}:{step.line}" if step.line else normalized_path
+            location = f"{normalized_path}:{binding_line}" if binding_line else normalized_path
             label = step.message or "flow"
             event_id: str | None = None
 
             if index == 0:
                 label = source_capability
-                event = event_index.get((normalized_path, step.line, source_capability))
-                if event is not None:
-                    event_id = event.event_id
                 slot_kind = raw_path.fields.get("sourceSlotKind", "")
                 symbol_hint = raw_path.fields.get("sourceSymbolHint", "")
                 expr_hint = raw_path.fields.get("sourceExprHint", "")
+                endpoint_events = event_index.get((normalized_path, binding_line, source_capability), [])
+                if len(endpoint_events) == 1:
+                    event_id = endpoint_events[0].event_id
+                elif source_capability == "env_var_read":
+                    names = {value for kind, value, _, _, _ in _extract_resources(
+                        expr_hint, "", source_capability, language=raw_path.language) if kind == "env_var"}
+                    matching = [event for event in endpoint_events if names.intersection(event.arguments)]
+                    if len(matching) == 1:
+                        event_id = matching[0].event_id
             elif index == len(raw_path.steps) - 1:
                 label = sink_capability
-                event = event_index.get((normalized_path, step.line, sink_capability))
-                if event is not None:
-                    event_id = event.event_id
+                endpoint_events = event_index.get((normalized_path, binding_line, sink_capability), [])
+                if len(endpoint_events) == 1:
+                    event_id = endpoint_events[0].event_id
                 slot_kind = raw_path.fields.get("sinkSlotKind", "")
                 symbol_hint = raw_path.fields.get("sinkSymbolHint", "")
                 expr_hint = raw_path.fields.get("sinkExprHint", "")
@@ -561,7 +606,7 @@ def normalize_codeql_paths(
                     expr_hint=expr_hint,
                 )
             )
-            segment_key.append((normalized_path, step.line))
+            segment_key.append((normalized_path, binding_line))
 
         if len(segments) < 2:
             continue
@@ -831,6 +876,10 @@ def build_gc_artifact(
             )
         )
     for path in paths:
+        nodes.append(GraphNode(node_id=path.path_id,kind="risk_path",attrs=path.model_dump(mode="json")))
+        for segment in path.segments:
+            if segment.event_id:
+                edges.append(GraphEdge(kind="path_event",source=path.path_id,target=segment.event_id))
         edges.append(
             GraphEdge(
                 kind=f"path:{path.path_kind}",
@@ -1102,6 +1151,8 @@ def derive_data_object_graph(
                 )
             )
 
+        flow_kind = ("candidate_pair" if path.evidence_level == "weak" else
+                     "bridge_connectivity" if path.evidence_level == "bridge" else "path_step")
         for source_object_id, target_object_id in zip(object_ids, object_ids[1:], strict=False):
             edge_key = (source_object_id, target_object_id, path.path_id)
             if edge_key in seen_edges:
@@ -1112,7 +1163,7 @@ def derive_data_object_graph(
                     edge_id=f"flow::{path.path_id}::{len(data_flow_edges)}",
                     source_object_id=source_object_id,
                     target_object_id=target_object_id,
-                    flow_kind="path_step",
+                    flow_kind=flow_kind,
                     evidence_level=path.evidence_level,
                     path_id=path.path_id,
                 )
@@ -1171,20 +1222,7 @@ def _resolve_import_target(
         }
         return sorted(candidates)[0] if candidates else None
 
-    base = (source_parent / raw).as_posix()
-    import_candidates = [
-        base,
-        f"{base}.js",
-        f"{base}.ts",
-        f"{base}.mjs",
-        f"{base}/index.js",
-        f"{base}/index.ts",
-    ]
-    for candidate in import_candidates:
-        normalized = _normalize_relpath(candidate)
-        if normalized in unit_by_path:
-            return normalized
-    return None
+    return resolve_js_import(source_path, imported, unit_by_path)
 
 
 def _event_segment(event: CapabilityEvent) -> PathSegment:
@@ -1216,7 +1254,7 @@ def _data_object_kind_for_segment(
             return "request_payload"
         if capability in {"file_write", "temp_file_create"}:
             return "written_content"
-        if capability in {"shell_exec", "subprocess_spawn"}:
+        if capability in {"shell_exec", "subprocess"}:
             return "command_payload"
     if capability == "config_file":
         return "config_value"
@@ -1337,7 +1375,7 @@ def _semantic_sink_kind(
         return "network_payload"
     if capability in {"file_write", "temp_file_create"}:
         return "written_content"
-    if capability in {"shell_exec", "subprocess_spawn"}:
+    if capability in {"shell_exec", "subprocess"}:
         return "command_payload"
     return None
 
@@ -1488,7 +1526,7 @@ def _sink_slot_refinement(
         if match is not None:
             return "http_body_arg", match.group(1)
         return "http_request_call", ""
-    if capability in {"shell_exec", "subprocess_spawn"}:
+    if capability in {"shell_exec", "subprocess"}:
         match = re.search(
             r"(?:system|run|Popen|call|check_call|check_output)\(\s*([A-Za-z_][A-Za-z0-9_]*)",
             text,

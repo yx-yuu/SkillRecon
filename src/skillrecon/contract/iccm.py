@@ -8,12 +8,13 @@ import re
 from pathlib import Path
 from urllib.parse import urlparse
 
+from skillrecon.core.config import PROJECT_ROOT
 from skillrecon.core.types import ClauseSample, ClauseSampleList, DocBlock, Step
 from skillrecon.llm.cache import CachedLLMClient
 
 logger = logging.getLogger(__name__)
 
-_PROMPT_DIR = Path("experiments/prompts/iccm")
+_PROMPT_DIR = PROJECT_ROOT / "experiments/prompts/iccm"
 _MAX_BLOCKS_PER_CALL = 24
 _MAX_RECALL_BLOCKS_PER_CALL = 16
 _URL_RE = re.compile(r"https?://[^\s)\]}>\"']+")
@@ -75,7 +76,7 @@ def _format_doc_blocks(doc_blocks: list[DocBlock] | list[Step]) -> str:
     return "\n\n---\n\n".join(parts)
 
 
-def _load_taxonomy_atoms(taxonomy_path: str = "experiments/configs/taxonomy_v2.json") -> list[str]:
+def _load_taxonomy_atoms(taxonomy_path: str = str(PROJECT_ROOT / "experiments/configs/taxonomy_v3.json")) -> list[str]:
     """Load capability atom names from taxonomy JSON."""
     with open(taxonomy_path, encoding="utf-8") as f:
         data = json.load(f)
@@ -92,7 +93,7 @@ class ICCMExtractor:
         self,
         client: CachedLLMClient,
         taxonomy_atoms: list[str] | None = None,
-        prompt_version: str = "v1",
+        prompt_version: str = "v2",
     ) -> None:
         self._client = client
         self._atoms = taxonomy_atoms or _load_taxonomy_atoms()
@@ -292,7 +293,7 @@ class ICCMExtractor:
                 messages,
                 ClauseSampleList,
                 skill_id=skill_id,
-                call_key=call_key,
+                call_key=f"{call_key}_filter_safe",
             )
         except Exception as exc:
             raise ICCMExtractionError(

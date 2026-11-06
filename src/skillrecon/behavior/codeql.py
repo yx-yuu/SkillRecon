@@ -104,6 +104,15 @@ def stage_skill_sources(
             continue
 
         doc_entry = file_map[unit.file_id]
+        if unit.source_pointer is not None:
+            from skillrecon.loader.platforms import json_pointer
+            payload = json.loads((skill_path / doc_entry.relative_path).read_text(encoding="utf-8"))
+            relative_path = f".skillrecon_synthetic/{unit.unit_id}.sh"
+            destination = staged_root / relative_path
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            destination.write_text(json_pointer(payload,unit.source_pointer), encoding="utf-8")
+            unit_paths[unit.unit_id] = relative_path
+            continue
         block_map = block_cache.get(unit.source_doc_id)
         if block_map is None:
             doc_content = (skill_path / doc_entry.relative_path).read_text(encoding="utf-8")
@@ -149,7 +158,7 @@ def ensure_codeql_database(
     meta_path = db_path / ".skillrecon_meta.json"
     if db_path.exists() and meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("source_fingerprint") == source_fingerprint:
+        if meta.get("source_fingerprint") == source_fingerprint and meta.get("build_mode") == "none":
             logger.info("Reusing CodeQL database: %s", db_path)
             return
 
@@ -166,8 +175,7 @@ def ensure_codeql_database(
         f"--source-root={source_root}",
         "--overwrite",
     ]
-    if language == "python":
-        cmd.append("--command=true")
+    cmd.append("--build-mode=none")
     _run_command(cmd, cwd=source_root.parent)
     meta_path.write_text(
         json.dumps(
@@ -175,6 +183,7 @@ def ensure_codeql_database(
                 "language": language,
                 "source_root": str(source_root),
                 "source_fingerprint": source_fingerprint,
+                "build_mode": "none",
             },
             ensure_ascii=False,
             indent=2,
@@ -191,10 +200,16 @@ def run_codeql_analysis(
     source_fingerprint: str,
 ) -> None:
     """Run a CodeQL query pack directory and emit SARIF output."""
+    query_files = {
+        str(path.relative_to(query_dir)): path.stat().st_mtime_ns
+        for path in sorted(query_dir.rglob("*"))
+        if path.is_file() and path.suffix in {".ql", ".qll", ".yml"}
+    }
     meta_path = output_path.with_suffix(output_path.suffix + ".meta.json")
     if output_path.is_file() and meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        if meta.get("source_fingerprint") == source_fingerprint:
+        if (meta.get("source_fingerprint") == source_fingerprint
+                and meta.get("query_files") == query_files):
             logger.info("Reusing SARIF output: %s", output_path)
             return
 
@@ -206,6 +221,7 @@ def run_codeql_analysis(
         str(db_path),
         str(query_dir),
         "--format=sarif-latest",
+        "--rerun",
         f"--output={output_path}",
     ]
     _run_command(cmd, cwd=query_dir)
@@ -215,6 +231,7 @@ def run_codeql_analysis(
                 "database": str(db_path),
                 "query_dir": str(query_dir),
                 "source_fingerprint": source_fingerprint,
+                "query_files": query_files,
             },
             ensure_ascii=False,
             indent=2,

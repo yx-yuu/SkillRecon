@@ -19,9 +19,12 @@ class LLMConfig(BaseModel):
     base_url: str
     model: str
     api_key_env: str = "SKILLRECON_API_KEY"
+    api_key_file: str | None = None
     temperature: float = 0.0
     max_tokens: int = 4096
     structured_output_mode: Literal["json_schema", "json_prompt"] = "json_schema"
+    cache_only: bool = False
+    cache_root: str | None = None
 
 
 class VotePolicy(BaseModel):
@@ -29,7 +32,7 @@ class VotePolicy(BaseModel):
 
     model_config = ConfigDict(frozen=True)
 
-    n_samples: int = 1
+    n_samples: int = 5
     agreement_threshold: float = 0.6
 
 
@@ -42,7 +45,9 @@ class ReconciliationPolicy(BaseModel):
     max_alignment_fallbacks_per_step: int = 3
     max_semantic_event_fallbacks: int = 3
     max_semantic_path_fallbacks: int = 2
-    overlap_policy_path: str = "experiments/configs/overlap_policy_v1.json"
+    overlap_policy_path: str = "experiments/configs/overlap_policy_v2.json"
+    witness_max_nodes: int = 18
+    witness_max_edges: int = 36
 
 
 class AnalyzerConfig(BaseModel):
@@ -53,8 +58,8 @@ class AnalyzerConfig(BaseModel):
     llm: LLMConfig
     vote_policy: VotePolicy = VotePolicy()
     reconciliation_policy: ReconciliationPolicy = ReconciliationPolicy()
-    taxonomy_version: str = "v2"
-    prompt_version: str = "v1"
+    taxonomy_version: str = "v3"
+    prompt_version: str = "v2"
 
     @property
     def taxonomy_path(self) -> Path:
@@ -104,13 +109,16 @@ def load_env_config(path: Path = DEFAULT_ENV_CONFIG_PATH) -> EnvConfig:
 def load_llm_config(path: Path = DEFAULT_LLM_CONFIG_PATH) -> LLMConfig:
     """Load a standalone LLM config JSON.
 
-    The file may either contain the LLM fields directly or contain a top-level
-    ``llm`` object for compatibility with ``env_config.json``.
+    Accept standalone LLM fields or a top-level ``llm`` object.
     """
     resolved_path = path.resolve()
     payload = json.loads(resolved_path.read_text(encoding="utf-8"))
     if isinstance(payload, dict) and isinstance(payload.get("llm"), dict):
         payload = payload["llm"]
+    if "url" in payload:
+        payload["base_url"] = payload.pop("url")
+        payload.pop("api_key")
+        payload["api_key_file"] = str(resolved_path)
     return LLMConfig.model_validate(payload)
 
 
@@ -127,9 +135,7 @@ def resolve_llm_config(
 ) -> LLMConfig:
     """Resolve the LLM config used by scripts.
 
-    The standalone ``llm_config.json`` is the default source of truth. The
-    ``env_config.llm`` fallback is kept only for older local configs, while CLI
-    values override either file.
+    Load the selected configuration and apply explicit command-line overrides.
     """
     base_config: LLMConfig | None = None
     if llm_config_path is not None:
@@ -161,4 +167,6 @@ def resolve_llm_config(
         }.items()
         if value is not None
     }
+    if api_key_env is not None:
+        overrides["api_key_file"] = None
     return base_config.model_copy(update=overrides)

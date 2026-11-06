@@ -1,0 +1,19 @@
+[
+ {"name":"n1","n":1},
+ {"name":"n3","n":3},
+ {"name":"n5","n":5},
+ {"name":"n7","n":7},
+ {"name":"n10","n":10},
+ {"name":"theta04","theta":0.4},
+ {"name":"theta05","theta":0.5},
+ {"name":"theta06","theta":0.6},
+ {"name":"theta07","theta":0.7},
+ {"name":"theta08","theta":0.8},
+ {"name":"kc4","k_c":4},
+ {"name":"kc8","k_c":8},
+ {"name":"kc12","k_c":12},
+ {"name":"kc16","k_c":16},
+ {"name":"bounds12-24","witness_bounds":[12,24]},
+ {"name":"bounds18-36","witness_bounds":[18,36]},
+ {"name":"bounds24-48","witness_bounds":[24,48]}
+]

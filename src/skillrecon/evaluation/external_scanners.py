@@ -40,6 +40,36 @@ class ExternalScannerSpec:
 
 EXTERNAL_SCANNER_SPECS: tuple[ExternalScannerSpec, ...] = (
     ExternalScannerSpec(
+        system_id="baseline_openclaw", display_name="OpenClaw Scan",
+        executable="openclaw-scan", repo_url="https://clawhub.ai/",
+        method_reference="Upstream ClawHub/OpenClaw native package screening",
+        install_hint="Import the upstream scan JSON with --raw-json skill_id=scan.json",
+        command_kind="openclaw_import", optional=True,
+        notes="Native hosted screening is imported; this adapter does not impersonate the service.",
+    ),
+    ExternalScannerSpec(
+        system_id="baseline_malskills_full",
+        display_name="MalSkills (native full)",
+        executable="malskills",
+        repo_url="https://github.com/security-pride/MalSkills",
+        method_reference="MalSkills: neuro-symbolic malicious skill analysis (arXiv:2603.27204)",
+        install_hint="Use the pinned MalSkills/YASA checkout and authenticated native LLM configuration",
+        command_kind="malskills_full",
+        success_exit_codes=(0,),
+        notes="Native hybrid profile with LLM extraction/object analysis, YASA and cross-artifact resolution. Record actual language support and LLM calls separately from static.",
+    ),
+    ExternalScannerSpec(
+        system_id="baseline_malskills_static",
+        display_name="MalSkills (native static)",
+        executable="malskills",
+        repo_url="https://github.com/security-pride/MalSkills",
+        method_reference="MalSkills: neuro-symbolic malicious skill analysis (arXiv:2603.27204)",
+        install_hint="Install the pinned MalSkills checkout in its isolated environment",
+        command_kind="malskills_static",
+        success_exit_codes=(0,),
+        notes="Author-provided static/formal profile; retain native SDG/proofs and binary verdict. Full LLM/YASA profile is a separate configuration.",
+    ),
+    ExternalScannerSpec(
         system_id="baseline_skillfortify",
         display_name="SkillFortify",
         executable="skillfortify",
@@ -87,9 +117,7 @@ EXTERNAL_SCANNER_SPECS: tuple[ExternalScannerSpec, ...] = (
         ),
         command_kind="skillspector",
         notes=(
-            "Static scanner baseline with documented JSON/SARIF outputs; "
-            "Python 3.12+ requirement may make it optional in older reviewer "
-            "environments."
+            "Native static and LLM analysis with JSON/SARIF output."
         ),
     ),
     ExternalScannerSpec(
@@ -106,8 +134,7 @@ EXTERNAL_SCANNER_SPECS: tuple[ExternalScannerSpec, ...] = (
         output_to_file=False,
         optional=True,
         notes=(
-            "Product baseline that requires Snyk credentials; kept optional "
-            "instead of a mandatory reviewer smoke dependency."
+            "Native Snyk scanner configured with SNYK_TOKEN."
         ),
     ),
 )
@@ -177,6 +204,34 @@ def load_external_scanner_payload(path: Path) -> dict[str, Any] | list[Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_malskills_payload(verdict_path: Path, *, require_full: bool = False) -> dict[str, Any]:
+    """Read the author's canonical output directory without altering its files."""
+    root = verdict_path.parent
+    metadata = json.loads((root / "analysis_metadata.json").read_text(encoding="utf-8"))
+    if metadata["semgrep"]["status"] != "ok":
+        raise ValueError(f"MalSkills static extraction did not complete: {metadata['semgrep']['status']}")
+    execution = []
+    if require_full:
+        trace = root / "native_execution.jsonl"
+        if not trace.is_file():
+            raise ValueError("MalSkills full profile lacks native execution evidence; run with the instrumented native entrypoint")
+        execution = [json.loads(line) for line in trace.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if any(row.get("success") is False for row in execution):
+            raise ValueError("MalSkills full profile has a failed native model/engine stage")
+        if not any(row["stage"]=="llm" and row["success"] for row in execution):
+            raise ValueError("MalSkills full profile has no verified structured model response")
+    manifest = json.loads((root / "output_manifest.json").read_text(encoding="utf-8"))
+    return {
+        "native_tool": "malskills",
+        "verdict": load_external_scanner_payload(verdict_path),
+        "sso_findings": json.loads((root / "sso_findings.json").read_text(encoding="utf-8")),
+        "proofs": json.loads((root / "proofs.json").read_text(encoding="utf-8")),
+        "analysis_metadata": metadata,
+        "native_execution": execution,
+        "native_output_refs": {key: str(root / name) for key, name in manifest["files"].items()},
+    }
+
+
 def external_scanner_payload_to_prediction(
     *,
     skill_id: str,
@@ -193,6 +248,13 @@ def external_scanner_payload_to_prediction(
         "exposure_count": normalized["exposure_count"],
         "max_severity": normalized["max_severity"],
         "source_schema": normalized["source_schema"],
+        "native_flag": normalized["native_flag"],
+        "flag_policy": normalized["flag_policy"],
+        "label_semantics": "native_security_alert",
+        "native_findings": normalized["native_findings"],
+        "supported_subtypes": [],
+        "analysis_status": "success",
+        **normalized.get("native_metadata", {}),
     }
     if raw_output_ref is not None:
         metadata["raw_output"] = raw_output_ref
@@ -240,13 +302,20 @@ def external_scanner_payload_to_report(
         "external_scanner": system_id,
         "source_schema": normalized["source_schema"],
         "max_severity": normalized["max_severity"],
+        "native_flag": normalized["native_flag"],
+        "flag_policy": normalized["flag_policy"],
+        "label_semantics": "native_security_alert",
+        "native_findings": normalized["native_findings"],
+        "supported_subtypes": [],
+        "analysis_status": "success",
+        **normalized.get("native_metadata", {}),
     }
     if raw_output_ref is not None:
         config["raw_output"] = raw_output_ref
     return EvaluationReport(
         skill_id=skill_id,
         system_id=system_id,
-        analyzer_version=f"{system_id}-adapter-v1",
+        analyzer_version=f"{system_id}-adapter-v2",
         config=config,
         overall_label=normalized["overall_label"],
         violation_findings=violation_findings,
@@ -263,9 +332,25 @@ def build_external_scanner_command(
     *,
     skill_path: Path,
     output_path: Path,
+    scanner_config: Path | None = None,
 ) -> list[str]:
-    """Build the offline CLI command for a scanner spec."""
+    """Build the native CLI command, retaining the scanner's default analyzers."""
 
+    if spec.command_kind == "openclaw_import":
+        raise ValueError("OpenClaw Scan uses upstream native scan exports: supply --raw-json")
+
+    if spec.command_kind == "malskills_full":
+        command = [spec.executable, "analyze-skill", str(skill_path), "--output", str(output_path.parent),
+                   "--reasoning-mode", "hybrid"]
+        if scanner_config is not None:
+            command.extend(["--llm-config", str(scanner_config)])
+        return command
+    if spec.command_kind == "malskills_static":
+        return [
+            spec.executable, "analyze-skill", str(skill_path), "--output", str(output_path.parent),
+            "--disable-llm-sso-extraction", "--disable-llm-object-analysis", "--disable-yasa",
+            "--disable-cross-artifact-resolution", "--reasoning-mode", "formal",
+        ]
     if spec.command_kind == "skillfortify":
         return [spec.executable, "scan", str(skill_path), "--format", "json"]
     if spec.command_kind == "cisco_skill_scanner":
@@ -284,7 +369,6 @@ def build_external_scanner_command(
             spec.executable,
             "scan",
             str(skill_path),
-            "--no-llm",
             "--format",
             "json",
             "--output",
@@ -307,17 +391,19 @@ def _normalize_payload(
     system_id: str,
     payload: dict[str, Any] | list[Any],
 ) -> dict[str, Any]:
+    if system_id in {"baseline_malskills_static", "baseline_malskills_full"}:
+        return _normalize_malskills(payload, system_id=system_id)
+    native_flag, flag_policy = _native_flag(payload)
     findings = list(_payload_findings(system_id, payload))
     if not findings:
         synthetic = _synthetic_top_level_finding(system_id, payload)
         if synthetic is not None:
             findings.append(synthetic)
 
-    violation_count = sum(1 for item in findings if item.main_label == "violation")
     exposure_count = sum(1 for item in findings if item.main_label == "exposure-only")
     overall_label = (
         "violation"
-        if violation_count
+        if native_flag
         else "exposure-only"
         if exposure_count
         else "benign"
@@ -330,7 +416,93 @@ def _normalize_payload(
         "max_severity": _payload_max_severity(payload, findings),
         "score": _payload_score(payload),
         "source_schema": _detect_schema(payload),
+        "native_flag": native_flag,
+        "flag_policy": flag_policy,
+        "native_findings": _iter_raw_findings(payload, deduplicate=False),
     }
+
+
+def _normalize_malskills(payload: dict[str, Any], *, system_id: str) -> dict[str, Any]:
+    if system_id == "baseline_malskills_full" and not payload.get("native_execution"):
+        raise ValueError("Unverified MalSkills full execution cannot produce a successful prediction")
+    verdict = payload["verdict"]
+    if verdict["label"] not in {"malicious", "benign"}:
+        raise ValueError(f"Unknown native MalSkills verdict: {verdict['label']!r}")
+    native_flag = verdict["label"] == "malicious"
+    proofs = payload["proofs"]
+    findings = [
+        EvaluationFinding(
+            finding_id=f"{system_id}::{proof['pattern_id']}",
+            main_label="violation" if native_flag else "exposure-only",
+            subtype=None,
+            code_locations=[
+                CodeLocation(path=finding["artifact_path"], line=finding["span"]["start_line"] if finding.get("span") else None)
+                for finding in payload["sso_findings"] if finding["finding_id"] in proof["finding_ids"]
+            ],
+            rationale=proof["explanation"],
+        ) for proof in proofs
+    ]
+    return {
+        "overall_label": "violation" if native_flag else "benign",
+        "findings": findings, "finding_count": len(findings),
+        "exposure_count": sum(finding.main_label == "exposure-only" for finding in findings),
+        "max_severity": "high" if native_flag else None, "score": None,
+        "source_schema": "malskills-canonical-output", "native_flag": native_flag,
+        "flag_policy": "native-maliciousness-verdict", "native_findings": payload["sso_findings"],
+        "native_metadata": {
+            "label_semantics": "native_maliciousness_alert",
+            "analyzer_profile": "full-hybrid" if system_id == "baseline_malskills_full" else "static-formal",
+            "native_verdict": verdict, "native_proofs": proofs,
+            "native_output_refs": payload["native_output_refs"],
+            "native_analysis_metadata": payload["analysis_metadata"],
+            "native_execution": payload.get("native_execution", []),
+        },
+    }
+
+
+def _native_flag(payload: Any) -> tuple[bool, str]:
+    """Read a native verdict, or apply the declared severity-only policy.
+
+    Finding prose and SkillRecon gold labels never participate in this rule.
+    An unrecognized payload is an import failure, not a negative prediction.
+    """
+    if isinstance(payload, list):
+        if payload and all(isinstance(item, dict) and "is_safe" in item for item in payload):
+            if not all(isinstance(item["is_safe"], bool) for item in payload):
+                raise ValueError("Native is_safe verdict must be boolean")
+            return any(not item["is_safe"] for item in payload), "any-native-is-safe-false"
+    elif isinstance(payload, dict):
+        if payload.get("status") in {"benign", "suspicious", "malicious"}:
+            return payload["status"] != "benign", "native-screening-status"
+        if "is_safe" in payload:
+            if not isinstance(payload["is_safe"], bool):
+                raise ValueError("Native is_safe verdict must be boolean")
+            return not payload["is_safe"], "native-is-safe"
+        assessment = payload.get("risk_assessment", payload)
+        if isinstance(assessment, dict):
+            recommendation = assessment.get("recommendation")
+            if recommendation in ("SAFE", "DO_NOT_INSTALL"):
+                return recommendation == "DO_NOT_INSTALL", "native-install-recommendation"
+        if payload.get("unsafe") is True or payload.get("is_malicious") is True:
+            return True, "native-unsafe"
+    if not isinstance(payload, (dict, list)):
+        raise ValueError("Scanner output must be a JSON object or array")
+    raw_findings = _iter_raw_findings(payload)
+    recognized = isinstance(payload, list) or _is_sarif(payload) or bool(raw_findings)
+    if isinstance(payload, dict):
+        recognized = recognized or any(
+            key in payload for key in ("findings", "filtered_findings", "issues", "risk_severity", "max_severity", "risk_assessment")
+        )
+    if not recognized:
+        raise ValueError("Scanner output contains no recognized verdict or finding schema")
+    high_finding = any(
+        _severity_value(_raw_severity(raw)) >= _SEVERITY_ORDER["high"]
+        or raw.get("unsafe") is True
+        or raw.get("is_malicious") is True
+        for raw in raw_findings
+    )
+    top_severity = _payload_max_severity(payload, [])
+    return high_finding or _severity_value(top_severity) >= _SEVERITY_ORDER["high"], "severity-high-or-unsafe"
 
 
 def _payload_findings(
@@ -346,9 +518,18 @@ def _payload_findings(
     return normalized
 
 
-def _iter_raw_findings(payload: Any) -> list[dict[str, Any]]:
+def _iter_raw_findings(payload: Any, *, deduplicate: bool = True) -> list[dict[str, Any]]:
     if isinstance(payload, list):
-        return [item for item in payload if isinstance(item, dict)]
+        findings: list[dict[str, Any]] = []
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            # SkillFortify emits an array of skill reports, not an array of findings.
+            if "findings" in item:
+                findings.extend(_iter_raw_findings(item, deduplicate=deduplicate))
+            else:
+                findings.append(item)
+        return findings
     if not isinstance(payload, dict):
         return []
 
@@ -390,8 +571,8 @@ def _iter_raw_findings(payload: Any) -> list[dict[str, Any]]:
     ):
         nested_payload = payload.get(key)
         if isinstance(nested_payload, (dict, list)):
-            findings.extend(_iter_raw_findings(nested_payload))
-    return _dedupe_raw_findings(findings)
+            findings.extend(_iter_raw_findings(nested_payload, deduplicate=deduplicate))
+    return _dedupe_raw_findings(findings) if deduplicate else findings
 
 
 def _iter_sarif_findings(payload: dict[str, Any]) -> list[dict[str, Any]]:
@@ -438,12 +619,11 @@ def _normalize_raw_finding(
         return None
 
     main_label = _finding_label(raw, text, severity)
-    subtype = _finding_subtype(text) if main_label == "violation" else None
     finding_id = _raw_id(raw) or f"{system_id}::finding-{index:04d}"
     return EvaluationFinding(
         finding_id=f"{system_id}::{finding_id}",
         main_label=main_label,
-        subtype=subtype,
+        subtype=None,
         capability_atoms=_capability_atoms(text),
         code_locations=_raw_locations(raw),
         rationale=_raw_rationale(raw, text, severity),
@@ -451,61 +631,11 @@ def _normalize_raw_finding(
 
 
 def _finding_label(raw: dict[str, Any], text: str, severity: int) -> str:
-    lowered = text.lower()
     if severity >= _SEVERITY_ORDER["high"]:
-        return "violation"
-    if any(
-        token in lowered
-        for token in (
-            "underdeclared",
-            "undeclared",
-            "description-behavior mismatch",
-            "behavior mismatch",
-            "least privilege",
-            "permission",
-            "scope creep",
-            "scope violation",
-            "excessive agency",
-        )
-    ):
         return "violation"
     if raw.get("is_malicious") is True or raw.get("unsafe") is True:
         return "violation"
     return "exposure-only"
-
-
-def _finding_subtype(text: str) -> str:
-    lowered = text.lower()
-    if any(
-        token in lowered
-        for token in (
-            "chain",
-            "taint",
-            "pipeline",
-            "flow",
-            "source-to-sink",
-            "tool misuse",
-            "file read to network",
-            "credential exfiltration chain",
-        )
-    ):
-        return "unjustified_composition"
-    if any(
-        token in lowered
-        for token in (
-            "scope",
-            "permission",
-            "least privilege",
-            "underdeclared",
-            "undeclared",
-            "wildcard",
-            "overdeclared",
-            "unbounded resource",
-            "excessive agency",
-        )
-    ):
-        return "scope_violation"
-    return "unsupported_behavior"
 
 
 def _capability_atoms(text: str) -> list[str]:
@@ -550,24 +680,20 @@ def _synthetic_top_level_finding(
             ),
         )
     )
-    score = _payload_score(payload)
     status_text = _top_level_text(payload).lower()
-    if severity >= _SEVERITY_ORDER["high"] or (score is not None and score >= 51):
+    if severity >= _SEVERITY_ORDER["high"]:
         label = "violation"
-        subtype = _finding_subtype(status_text)
     elif (
         severity >= _SEVERITY_ORDER["medium"]
-        or (score is not None and score >= 21)
         or any(token in status_text for token in ("warning", "caution", "review"))
     ):
         label = "exposure-only"
-        subtype = None
     else:
         return None
     return EvaluationFinding(
         finding_id=f"{system_id}::top-level-risk",
         main_label=label,
-        subtype=subtype,
+        subtype=None,
         rationale=(
             "External scanner reported top-level risk without itemized findings: "
             f"{_top_level_text(payload)}"

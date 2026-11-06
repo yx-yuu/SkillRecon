@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": [
+    "skill_id",
+    "gold"
+  ],
+  "properties": {
+    "skill_id": {
+      "type": "string"
+    },
+    "clause_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "constraint_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "event_ids": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    },
+    "gold": {
+      "type": "object",
+      "properties": {
+        "guard_downgrade": {
+          "type": "boolean"
+        },
+        "scope_abstain": {
+          "type": "boolean"
+        },
+        "prohibition_block": {
+          "type": "boolean"
+        }
+      }
+    }
+  }
+}

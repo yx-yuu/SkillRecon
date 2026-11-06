@@ -20,15 +20,15 @@ _NETWORK_CAPABILITIES = {
     "websocket",
     "smtp_send",
     "ssh_connect",
-    "data_upload",
-    "data_encode_send",
-    "dns_lookup",
+    "upload_exfil",
+    "data_encode",
+    "dns_query",
     "socket_connect",
     "ftp_transfer",
 }
 _EXEC_CAPABILITIES = {
     "shell_exec",
-    "subprocess_spawn",
+    "subprocess",
     "dynamic_import",
     "process_kill",
 }
@@ -175,6 +175,21 @@ def infer_typed_constraint(
     if not value:
         return None
 
+    aliases = {"prefix": "prefix", "ext": "ext", "host": "host", "domain": "domain",
+               "path": "path", "var": "env_var", "cmd": "command", "scheme": "scheme",
+               "port": "port", "opt_out_env": "empty_disables", "account_active": "config_enabled",
+               "interpreter": "interpreter", "arg_pattern": "arg_pattern",
+               "provenance": "provenance", "location": "location", "trigger": "trigger",
+               "lifetime": "lifetime", "source_class": "source_class", "sink_domain": "sink_domain",
+               "standalone_call":"standalone_call", "retry_on_error":"retry_on_error"}
+    key, separator, payload = value.partition(":")
+    if separator and key in aliases:
+        return aliases[key], payload.strip()
+    if value == "read_only":
+        return "side_effect_bound", "read_only"
+    if value in {"no_auto_retry", "separate_invocation"}:
+        return value, value
+
     semantic = _infer_semantic_constraint(value)
     if semantic is not None:
         return semantic
@@ -226,6 +241,8 @@ def _infer_file_constraint(value: str) -> tuple[str, str] | None:
 
 
 def _infer_network_constraint(value: str) -> tuple[str, str] | None:
+    if value.upper() in {"GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"}:
+        return "http_method", value.upper()
     if _looks_like_url(value):
         return ("url_glob" if _has_glob(value) else "url", value)
     if _looks_like_domain(value):
@@ -328,7 +345,21 @@ def _command_head(value: str) -> str | None:
 
 def looks_typed_constraint_applicable(constraint: Constraint) -> bool:
     """Whether a constraint participates in deterministic scope checking."""
-    return constraint.constraint_type.lower() != "scope"
+    return is_resource_constraint(constraint) or constraint.constraint_type.lower() in {
+        "http_method",
+        "user_input_only",
+        "config_bound",
+        "side_effect_bound",
+        "config_enabled",
+        "empty_disables",
+        "standalone_call",
+        "retry_on_error",
+        "credential_source", "dependency_declared",
+        "prefix", "ext", "host", "scheme", "port", "interpreter", "arg_pattern",
+        "provenance", "location", "trigger", "lifetime", "source_class", "sink_domain",
+        "no_auto_retry", "separate_invocation",
+        "opt_out_env", "account_active", "read_only", "var", "cmd",
+    }
 
 
 def is_resource_constraint(constraint: Constraint) -> bool:
@@ -346,13 +377,6 @@ def is_resource_constraint(constraint: Constraint) -> bool:
         "command",
         "command_glob",
         "query",
-    }
-
-
-def is_scope_constraint(constraint: Constraint) -> bool:
-    """Whether a constraint should be enforced as higher-level scope logic."""
-    return constraint.constraint_type.lower() in {
-        "user_input_only",
-        "config_bound",
-        "side_effect_bound",
+        "prefix", "ext", "host", "scheme", "port", "interpreter", "arg_pattern",
+        "provenance", "location",
     }

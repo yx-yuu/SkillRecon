@@ -81,7 +81,11 @@ class WitnessPipeline:
             judgments=judgments,
             certificates=certificates,
             projection_edges=projection_edges,
+            replay_inputs=json.loads((skill_dir / "replay_inputs.json").read_text(encoding="utf-8")),
+            n_max=self._config.reconciliation_policy.witness_max_nodes,
+            m_max=self._config.reconciliation_policy.witness_max_edges,
         )
+        self._save_artifact(skill_dir / "g_x.json", bundle.evidence_graph)
         valid_witnesses = [
             witness
             for witness, validation in zip(bundle.witnesses, bundle.validations, strict=True)
@@ -126,6 +130,9 @@ class WitnessPipeline:
             skill_dir / "permission_manifest.json",
             [entry.model_dump() for entry in bundle.permission_manifest],
         )
+        if (skill_dir / "replay_inputs.json").is_file():
+            from skillrecon.detect.replay import export_bundles
+            export_bundles(skill_dir)
 
         logger.info(
             "Witness pipeline complete: %d findings, %d exposures, %d diagnostics -> %d valid witnesses, %d witness contexts (%d rejected)",

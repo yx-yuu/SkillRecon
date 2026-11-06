@@ -34,9 +34,9 @@ from skillrecon.core.types import (
 _PLANNING_SENSITIVE_CAPABILITIES = {
     "api_key_use",
     "credential_store_access",
-    "cron_schedule",
-    "data_encode_send",
-    "data_upload",
+    "cron_write",
+    "data_encode",
+    "upload_exfil",
     "deserialization",
     "dynamic_import",
     "env_var_read",
@@ -46,7 +46,7 @@ _PLANNING_SENSITIVE_CAPABILITIES = {
     "shell_exec",
     "sql_exec",
     "ssh_connect",
-    "subprocess_spawn",
+    "subprocess",
     "token_file_read",
 }
 
@@ -106,11 +106,12 @@ def materialize_findings(
                     Finding(
                         finding_id=f"finding-{counter:04d}",
                         finding_type=FindingType.UNSUPPORTED_BEHAVIOR,
-                        support_level=FindingSupportLevel.DIAGNOSTIC,
-                        support_strength=SupportStrength.NONE,
+                        support_level=FindingSupportLevel.GRAPH_BACKED,
+                        support_strength=SupportStrength.STRONG,
                         certificate_ids=[certificate.certificate_id],
                         supporting_judgment_ids=list(certificate.supporting_judgment_ids),
                         related_event_ids=sensitive_event_ids,
+                        related_resource_ids=[ref for ref in certificate.subject_refs if ref not in events_by_id],
                         rationale=(
                             "Observed behavior has no supporting declaration path in the "
                             "admitted policy graph."
@@ -137,14 +138,17 @@ def materialize_findings(
                         certificate.subject_refs,
                         projection_edges,
                     ),
-                    related_clause_ids=sorted(
-                        ref for ref in certificate.subject_refs if ref.startswith("c")
-                    ),
+                    related_clause_ids=[certificate.subject_refs[0]],
                     related_event_ids=event_ids,
                     rationale="Observed behavior contradicts an explicit prohibited rule.",
                 )
             )
         elif certificate.kind == CertificateKind.SCOPE_FAILURE:
+            # ScopeFailure carries [constraint_id, resource_id]; canonical
+            # constraint IDs are clause-prefixed, rather than starting "cst".
+            constraint_id, resource_id = certificate.subject_refs
+            constraint_ids = [constraint_id]
+            resource_ids = [resource_id]
             counter += 1
             findings.append(
                 Finding(
@@ -169,6 +173,12 @@ def materialize_findings(
                     ),
                     related_constraint_ids=constraint_ids,
                     related_resource_ids=resource_ids,
+                    related_event_ids=list(dict.fromkeys(edge.event_id for edge in projection_edges
+                        if edge.relation==RelationKind.SCOPE_VIOLATES and edge.constraint_id==constraint_id
+                        and edge.resource_id==resource_id and edge.event_id is not None)),
+                    related_clause_ids=list(dict.fromkeys(edge.clause_id for edge in projection_edges
+                        if edge.relation==RelationKind.SCOPE_VIOLATES and edge.constraint_id==constraint_id
+                        and edge.resource_id==resource_id and edge.clause_id is not None)),
                     rationale="Observed resource usage violates an explicit documented scope.",
                 )
             )
@@ -188,17 +198,36 @@ def materialize_findings(
             ]
             if not sensitive_path_ids:
                 continue
+            path_judgments = [j for j in judgments
+                              if j.judgment_id in certificate.supporting_judgment_ids]
+            path_event_ids = list(dict.fromkeys(
+                segment.event_id for path_id in sensitive_path_ids
+                for segment in paths_by_id[path_id].segments
+                if segment.event_id in events_by_id
+                and event_requires_authorization(events_by_id[segment.event_id], a_req)))
+            support_edges = [edge for edge in projection_edges
+                             if edge.relation == RelationKind.SUPPORTS
+                             and edge.event_id in path_event_ids]
+            verified_path_failure = (
+                bool(path_event_ids)
+                and all(paths_by_id[path_id].evidence_level in {"codeql", "registered_source", "bridge"} for path_id in sensitive_path_ids)
+                and any(j.result == PredicateResult.FALSE
+                        for j in path_judgments)
+            )
             counter += 1
             findings.append(
                 Finding(
                     finding_id=f"finding-{counter:04d}",
                     finding_type=FindingType.UNJUSTIFIED_COMPOSITION,
-                    support_level=FindingSupportLevel.DIAGNOSTIC,
-                    support_strength=SupportStrength.NONE,
+                    support_level=FindingSupportLevel.GRAPH_BACKED if verified_path_failure else FindingSupportLevel.DIAGNOSTIC,
+                    support_strength=SupportStrength.STRONG if verified_path_failure else SupportStrength.NONE,
                     certificate_ids=[certificate.certificate_id],
                     supporting_judgment_ids=list(certificate.supporting_judgment_ids),
+                    supporting_edge_ids=[edge.edge_id for edge in support_edges] if verified_path_failure else [],
+                    related_event_ids=path_event_ids,
+                    related_clause_ids=list(dict.fromkeys(edge.clause_id for edge in support_edges if edge.clause_id)),
                     related_path_ids=sensitive_path_ids,
-                    rationale=(
+                    rationale="A verified source-to-sink path fails joint authorization." if verified_path_failure else (
                         "Recovered implementation composition lacks a justifying "
                         "declaration chain."
                     ),
@@ -447,11 +476,16 @@ def materialize_diagnostics(
             )
         )
 
+    order_uncertainty_messages = {
+        "unresolved_step_order": "The documented execution-order requirements for this path could not be resolved.",
+        "missing_step_evidence": "The documentation step evidence for this path's authorization could not be located.",
+        "contradictory_step_order": "The documented execution-order requirements for this path are contradictory.",
+    }
     for judgment in judgments:
         if (
             judgment.kind != JudgmentKind.PATH_JUSTIFICATION
             or judgment.result != PredicateResult.ABSTAIN
-            or judgment.abstain_reason != "partial_path_coverage"
+            or judgment.abstain_reason not in {"partial_path_coverage", *order_uncertainty_messages}
         ):
             continue
         related_path_ids = [
@@ -459,7 +493,11 @@ def materialize_diagnostics(
         ]
         if not related_path_ids:
             continue
-        related_event_ids = _event_ids_from_path_partial_note(judgment.notes)
+        related_event_ids = (
+            _event_ids_from_path_partial_note(judgment.notes)
+            if judgment.abstain_reason == "partial_path_coverage"
+            else [ref for ref in judgment.subject_refs if ref in events_by_id]
+        )
         counter += 1
         diagnostics.append(
             Diagnostic(
@@ -481,8 +519,12 @@ def materialize_diagnostics(
                 related_path_ids=related_path_ids,
                 related_event_ids=related_event_ids,
                 rationale=(
-                    "The recovered path is partially justified, but one or more "
-                    "authorization-sensitive segments remain only weakly covered."
+                    order_uncertainty_messages[judgment.abstain_reason]
+                    if judgment.abstain_reason in order_uncertainty_messages
+                    else (
+                        "The recovered path is partially justified, but one or more "
+                        "authorization-sensitive segments remain only weakly covered."
+                    )
                 ),
             )
         )
@@ -519,14 +561,13 @@ def _supporting_edge_ids_for_blocking_prohibition(
     subject_refs: list[str],
     projection_edges: list[ReconciliationEdge],
 ) -> list[str]:
-    clause_ids = {ref for ref in subject_refs if ref.startswith("c")}
-    event_ids = {ref for ref in subject_refs if ref.startswith("e")}
+    subjects = set(subject_refs)
     return [
         edge.edge_id
         for edge in projection_edges
         if edge.relation == RelationKind.CONTRADICTS
-        and edge.clause_id in clause_ids
-        and edge.event_id in event_ids
+        and edge.clause_id in subjects
+        and edge.event_id in subjects
     ]
 
 
@@ -545,15 +586,12 @@ def _support_strength_for_blocking_prohibition(
     subject_refs: list[str],
     projection_edges: list[ReconciliationEdge],
 ) -> SupportStrength:
+    supporting_ids = set(_supporting_edge_ids_for_blocking_prohibition(subject_refs, projection_edges))
     return _collapse_support_strength(
         [
             edge.support_strength
             for edge in projection_edges
-            if edge.edge_id
-            in _supporting_edge_ids_for_blocking_prohibition(
-                subject_refs,
-                projection_edges,
-            )
+            if edge.edge_id in supporting_ids
         ]
     )
 
@@ -579,16 +617,12 @@ def _support_strength_for_scope_failure(
     resource_ids: list[str],
     projection_edges: list[ReconciliationEdge],
 ) -> SupportStrength:
+    supporting_ids = set(_supporting_edge_ids_for_scope_failure(constraint_ids, resource_ids, projection_edges))
     return _collapse_support_strength(
         [
             edge.support_strength
             for edge in projection_edges
-            if edge.edge_id
-            in _supporting_edge_ids_for_scope_failure(
-                constraint_ids,
-                resource_ids,
-                projection_edges,
-            )
+            if edge.edge_id in supporting_ids
         ]
     )
 
@@ -656,15 +690,12 @@ def _support_strength_for_contract_quality_alert(
     judgment: ReconciliationJudgment,
     projection_edges: list[ReconciliationEdge],
 ) -> SupportStrength:
+    supporting_ids = set(_supporting_edge_ids_for_contract_quality_alert(judgment, projection_edges))
     return _collapse_support_strength(
         [
             edge.support_strength
             for edge in projection_edges
-            if edge.edge_id
-            in _supporting_edge_ids_for_contract_quality_alert(
-                judgment,
-                projection_edges,
-            )
+            if edge.edge_id in supporting_ids
         ]
     )
 
@@ -689,15 +720,13 @@ def _support_strength_for_partial_path_coverage(
     related_event_ids: list[str],
     projection_edges: list[ReconciliationEdge],
 ) -> SupportStrength:
+    supporting_ids = set(_supporting_edge_ids_for_partial_path_coverage(
+        related_event_ids=related_event_ids, projection_edges=projection_edges))
     return _collapse_support_strength(
         [
             edge.support_strength
             for edge in projection_edges
-            if edge.edge_id
-            in _supporting_edge_ids_for_partial_path_coverage(
-                related_event_ids=related_event_ids,
-                projection_edges=projection_edges,
-            )
+            if edge.edge_id in supporting_ids
         ]
     )
 
@@ -874,10 +903,9 @@ def _path_requires_composition_review(
     a_req: set[str],
     directly_flagged_event_ids: set[str],
 ) -> bool:
-    if not _path_requires_route_attention(path, events_by_id, a_req):
-        return False
-    sink_event_id = path.sink.event_id
-    return not (sink_event_id and sink_event_id in directly_flagged_event_ids)
+    event_ids = {segment.event_id for segment in path.segments if segment.event_id is not None}
+    return len(event_ids) >= 2 and any(event_id in events_by_id and
+        event_requires_authorization(events_by_id[event_id], a_req) for event_id in event_ids)
 
 
 def _path_sensitive_event_ids(
@@ -980,6 +1008,9 @@ def _finding_group_key(
     if finding.finding_type == FindingType.UNSUPPORTED_BEHAVIOR:
         return (
             finding.finding_type,
+            # Independent absence certificates have separate proof components.
+            # Sharing a file/capability does not connect those components.
+            tuple(sorted(finding.certificate_ids)),
             _event_family_signature(finding.related_event_ids, events_by_id),
             _event_file_signature(finding.related_event_ids, events_by_id),
         )

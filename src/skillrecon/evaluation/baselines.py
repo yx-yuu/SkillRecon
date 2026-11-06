@@ -9,13 +9,14 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict
 
 from skillrecon.core.config import AnalyzerConfig
-from skillrecon.core.enums import ClauseOperator
+from skillrecon.core.enums import ClauseOperator, ClauseRole, PredicateResult
 from skillrecon.core.sensitivity import event_capability_family, event_requires_authorization
 from skillrecon.core.types import CapabilityEvent, Clause, ResourceUse, RiskPath
 from skillrecon.llm.cache import CachedLLMClient
 from skillrecon.evaluation.datasets import BaselinePredictionRecord
 from skillrecon.evaluation.skillrecon_adapter import build_skillrecon_report
 from skillrecon.evaluation.types import EvaluationFinding, EvaluationReport, ReportSummary
+from skillrecon.reconcile.predicate import capability_overlaps, load_overlap_policy
 
 
 class _LLMJudgeDecision(BaseModel):
@@ -132,21 +133,25 @@ def build_capability_lattice_report(
     artifact_dir: Path,
     analyzer_config: AnalyzerConfig,
 ) -> EvaluationReport:
-    """A coarse declared-vs-inferred capability-set baseline."""
+    """Directed capability containment without resource/scope/path reconciliation."""
     contract_payload = json.loads((artifact_dir / "contract_table.json").read_text(encoding="utf-8"))
     clauses = [Clause.model_validate(item) for item in contract_payload.get("clauses", [])]
     events = _load_models(artifact_dir / "event_table.json", CapabilityEvent, allow_missing=True)
 
-    declared_caps = {clause.capability for clause in clauses}
+    declarations = [clause for clause in clauses
+                    if clause.role == ClauseRole.POLICY and clause.operator == ClauseOperator.ALLOWED]
+    overlap_map = load_overlap_policy(Path(analyzer_config.reconciliation_policy.overlap_policy_path))
+    a_req = _load_a_req(analyzer_config)
     findings: list[EvaluationFinding] = []
-    seen_families: set[str] = set()
+    seen_capabilities: set[str] = set()
     for event in events:
-        if not event_requires_authorization(event, _load_a_req(analyzer_config)):
+        if not event_requires_authorization(event, a_req):
             continue
-        cap_family = event_capability_family(event)
-        if event.capability in declared_caps or cap_family in declared_caps or cap_family in seen_families:
+        if event.capability in seen_capabilities or any(
+                capability_overlaps(clause,event.capability,overlap_map)==PredicateResult.TRUE
+                for clause in declarations):
             continue
-        seen_families.add(cap_family)
+        seen_capabilities.add(event.capability)
         findings.append(
             EvaluationFinding(
                 finding_id=f"cap-lattice::{event.event_id}",
@@ -154,8 +159,8 @@ def build_capability_lattice_report(
                 subtype="unsupported_behavior",
                 capability_atoms=[event.capability],
                 rationale=(
-                    "Capability-lattice baseline observed an inferred capability family "
-                    "outside the declared capability set."
+                    "Capability-lattice baseline observed an inferred capability "
+                    "outside the directed closure of permissive governing declarations."
                 ),
             )
         )
@@ -164,7 +169,7 @@ def build_capability_lattice_report(
     return EvaluationReport(
         skill_id=skill_id,
         system_id="baseline_capability_lattice",
-        analyzer_version="baseline-cap-v1",
+        analyzer_version="baseline-cap-v2",
         overall_label=overall_label,
         violation_findings=findings,
         summary=ReportSummary(violation_count=len(findings)),
@@ -425,7 +430,7 @@ def build_llm_judge_report(
     """An end-to-end LLM-as-judge baseline over summarized artifacts."""
     client = client or CachedLLMClient.from_config(
         analyzer_config.llm,
-        "evaluation_llm_judge_v2",
+        "evaluation_llm_judge_v3",
     )
     messages = [
         {"role": "system", "content": _LLM_JUDGE_SYSTEM_PROMPT},
@@ -441,7 +446,7 @@ def build_llm_judge_report(
         messages,
         _LLMJudgeDecision,
         skill_id=skill_id,
-        call_key="evaluation_llm_judge_v2",
+        call_key="evaluation_llm_judge_v3",
     )
     normalized_subtype = _normalize_llm_judge_subtype(
         main_label=decision.main_label,
@@ -473,7 +478,9 @@ def build_llm_judge_report(
     return EvaluationReport(
         skill_id=skill_id,
         system_id="baseline_llm_judge",
-        analyzer_version="baseline-llm-judge-v1",
+        analyzer_version="baseline-llm-judge-v3",
+        config={"analysis_status":"success","requested_model":analyzer_config.llm.model,
+                "input_coverage":json.loads((artifact_dir/"llm_judge_input.json").read_text())["input_coverage"]},
         overall_label=decision.main_label,
         violation_findings=violation_findings,
         exposure_findings=exposure_findings,
@@ -516,6 +523,7 @@ def build_external_prediction_report(
         skill_id=skill_id,
         system_id=system_id,
         analyzer_version=f"{system_id}-external-v1",
+        config=prediction.metadata,
         overall_label=prediction.main_label,
         violation_findings=violation_findings,
         exposure_findings=exposure_findings,
@@ -733,58 +741,34 @@ def _report_from_findings(
 
 
 def _build_llm_judge_prompt(*, skill_id: str, artifact_dir: Path) -> str:
-    contract_payload = json.loads((artifact_dir / "contract_table.json").read_text(encoding="utf-8"))
-    clauses = [Clause.model_validate(item) for item in contract_payload.get("clauses", [])]
-    events = _load_models(artifact_dir / "event_table.json", CapabilityEvent, allow_missing=True)
-    resources = _load_models(artifact_dir / "resource_table.json", ResourceUse, allow_missing=True)
-    paths = _load_models(artifact_dir / "path_table.json", RiskPath, allow_missing=True)
-
-    clause_summary = "\n".join(
-        (
-            f"- {clause.operator.value} {clause.capability} "
-            f"target={clause.target or 'none'} "
-            f"constraints={'; '.join(constraint.value for constraint in clause.constraints[:2]) or 'none'}"
-        )
-        for clause in clauses[:12]
-    ) or "- no clauses recovered"
-    event_summary = "\n".join(
-        f"- {event.capability} at {event.location} detail={event.detail or event.api_call or 'none'}"
-        for event in events[:16]
-    ) or "- no events recovered"
-    resource_summary = "\n".join(
-        f"- {resource.resource_type} value={resource.value} event={resource.event_id or 'none'} resolved={resource.resolved}"
-        for resource in resources[:16]
-    ) or "- no resources recovered"
-    path_summary = "\n".join(
-        f"- {path.source.label} -> {path.sink.label} ({path.path_kind})"
-        for path in paths[:8]
-    ) or "- no paths recovered"
-
-    return "\n".join(
-        [
-            f"Skill: {skill_id}",
-            "",
-            "Recovered Documentation Contract Summary:",
-            clause_summary,
-            "",
-            "Recovered Implementation Behavior Summary:",
-            event_summary,
-            "",
-            "Recovered Resource Summary:",
-            resource_summary,
-            "",
-            "Recovered Path Summary:",
-            path_summary,
-            "",
-            "Subtype decision rubric:",
-            "- unsupported_behavior: undocumented sensitive behavior or contradicted behavior.",
-            "- scope_violation: documented behavior exceeds a documented scope/target/resource boundary.",
-            "- unjustified_composition: the risky end-to-end path/chain is not justified even if parts are documented.",
-            "- If main_label is benign or exposure-only, subtype must be null.",
-            "",
-            "Return the best label and subtype using only the canonical subtype strings.",
-        ]
-    )
+    # This comparator sees source documentation and implementation directly;
+    # it does not inherit ICCM's clause/role/authorization decisions.
+    pack = json.loads((artifact_dir / "document_pack.json").read_text(encoding="utf-8"))
+    manifest = json.loads((artifact_dir / "package_manifest.json").read_text(encoding="utf-8"))
+    code = json.loads((artifact_dir / "code_pack.json").read_text(encoding="utf-8"))
+    files = {item["file_id"]: item["relative_path"] for item in manifest["files"]}
+    documents = []
+    for doc in pack["admitted_docs"]:
+        blocks = [block for block in pack["doc_blocks"] if block["doc_id"] == doc["doc_id"]]
+        documents.append({"path":files[doc["file_id"]], "blocks":[
+            {"type":block["block_type"], "heading":block["heading_context"],
+             "text":block["source_text"] or block["content"]} for block in blocks]})
+    implementation = [{"unit_id":unit, "path":relative,
+        "source":(Path(code["staged_root"]) / relative).read_text(encoding="utf-8")}
+        for unit,relative in sorted(code["unit_paths"].items())]
+    payload = {"skill_id":skill_id,"documentation_closure":documents,
+               "implementation_units":implementation,
+               "input_coverage":{"documents":len(documents),"units":len(implementation),
+                   "truncated":False,"iccm_clauses_used":False}}
+    (artifact_dir / "llm_judge_input.json").write_text(
+        json.dumps(payload,ensure_ascii=False,indent=2)+"\n", encoding="utf-8")
+    return json.dumps(payload,ensure_ascii=False) + "\n" + (
+        "Compare the implementation with its documented authorization. "
+        "unsupported_behavior: an undeclared/prohibited capability; scope_violation: "
+        "a documented boundary is exceeded; unjustified_composition: an unauthorized "
+        "source-to-sink workflow. For benign or exposure-only, subtype must be null. "
+        "Judge from the supplied source; absence of an inferred event is not proof of absence. "
+        "Return the structured decision and cite source locations in the rationale.")
 
 
 def _normalize_llm_judge_subtype(

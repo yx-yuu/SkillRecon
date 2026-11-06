@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import sys
 
 from skillrecon.core.types import CapabilityEvent
 
@@ -18,22 +19,27 @@ _PACKAGE_INSTALL_RE = re.compile(
 _MODULE_NAME_RE = re.compile(
     r"^@?[A-Za-z_][A-Za-z0-9_.-]*(?:/[A-Za-z0-9_.-]+)*$"
 )
-_SECRET_ENV_TOKENS = (
+_SECRET_ENV_PHRASES = (
     "ACCESS_KEY",
     "ACCESS_TOKEN",
     "APIKEY",
     "API_KEY",
     "AUTH_TOKEN",
-    "BEARER",
     "CLIENT_SECRET",
-    "COOKIE",
-    "CREDENTIAL",
-    "PASSWORD",
-    "PRIVATE",
-    "SECRET",
-    "SESSION",
-    "TOKEN",
+    "PRIVATE_KEY",
+    "SECRET_KEY",
+    "SIGNING_KEY",
+    "WALLET_KEY",
+    "SEED_PHRASE",
+    "SESSION_ID",
+    "SESSION_KEY",
+    "TOKEN_KEY",
+    "SECRET_ID",
 )
+_SECRET_ENV_SUFFIXES = {
+    "APIKEY", "BEARER", "COOKIE", "COOKIES", "CREDENTIAL", "CREDENTIALS", "PASSWORD",
+    "PRIVATE", "SECRET", "SESSION", "TOKEN", "MNEMONIC", "AK", "SK",
+}
 
 
 def event_capability_family(event: CapabilityEvent) -> str:
@@ -44,7 +50,7 @@ def event_capability_family(event: CapabilityEvent) -> str:
             if _looks_like_secret_env_access(event)
             else "config_env_var_read"
         )
-    if event.capability in {"shell_exec", "subprocess_spawn"}:
+    if event.capability in {"shell_exec", "subprocess"}:
         return (
             f"wrapper_{event.capability}"
             if _looks_like_wrapper_exec(event)
@@ -64,21 +70,18 @@ def event_requires_authorization(
     a_req: set[str],
 ) -> bool:
     """Decide whether a concrete event should count as authorization-sensitive."""
-    if event.capability not in a_req:
-        return False
-    if event.capability == "env_var_read":
-        return _looks_like_secret_env_access(event)
-    if event.capability in {"shell_exec", "subprocess_spawn"}:
-        return not _looks_like_wrapper_exec(event)
-    if event.capability == "dynamic_import":
-        return not _looks_like_local_module_import(event)
-    return True
+    return event.capability in a_req
 
 
 def _looks_like_secret_env_access(event: CapabilityEvent) -> bool:
     for name in _candidate_env_names(event):
         upper = name.upper()
-        if any(token in upper for token in _SECRET_ENV_TOKENS):
+        # Match credential words, not arbitrary substrings such as TOKENS or
+        # SESSION_LIMIT_MB. Named wallet/signing keys are credentials as well.
+        if (upper.rsplit("_", 1)[-1] in _SECRET_ENV_SUFFIXES
+                or upper.endswith(("API_KEY", "APIKEY", "CLIENTSECRET"))
+                or any(re.search(r"(?:^|_)"+phrase+r"(?:_|$)",upper)
+                       for phrase in _SECRET_ENV_PHRASES)):
             return True
     return False
 
@@ -112,6 +115,9 @@ def _looks_like_wrapper_exec(event: CapabilityEvent) -> bool:
 
 
 def _looks_like_local_module_import(event: CapabilityEvent) -> bool:
+    if event.language == "python" and event.api_call in {"__import__", "importlib.import_module"}:
+        if event.arguments and event.arguments[0].strip("'\"").split(".", 1)[0] in sys.stdlib_module_names:
+            return True
     return any(
         _IMPORT_FILE_RE.search(value)
         for value in _dynamic_import_candidates(event)

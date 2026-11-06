@@ -40,7 +40,6 @@ from skillrecon.evaluation.artifacts import (
 )
 from skillrecon.loader.manifest import build_manifest
 from skillrecon.reconcile.pipeline import ReconciliationPipeline
-from skillrecon.visualize import render_artifact_dir
 
 
 def _load_model_list(path: Path, model_cls: type[BaseModel]) -> list[BaseModel]:  # noqa: UP047
@@ -58,12 +57,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--skill", required=True, help="Skill directory name")
     parser.add_argument(
         "--data-root",
-        default="data/skill_dataset",
+        default="data/packages",
         help="Root directory of skill packages",
     )
     parser.add_argument(
         "--output-dir",
-        default="derived",
+        default="outputs/analysis",
         help="Output directory for artifacts",
     )
     parser.add_argument(
@@ -82,11 +81,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="ICCM sample count; omit to use env_config vote_policy.n_samples",
     )
     parser.add_argument("--codeql-bin", help="CodeQL binary override")
+    parser.add_argument("--native-only", action="store_true", help="Run Tier 2–4 without CodeQL")
     parser.add_argument("--base-url", help="LLM API base URL")
     parser.add_argument("--model", help="LLM model name")
     parser.add_argument("--api-key-env", help="API key env var or literal key")
     parser.add_argument("--temperature", type=float, help="LLM temperature override")
     parser.add_argument("--max-tokens", type=int, help="LLM max_tokens override")
+    parser.add_argument("--cache-only", action="store_true", help="Require cached responses; never initialize or call a model API")
+    parser.add_argument("--cache-root", help="Directory containing the original per-config LLM cache")
+    parser.add_argument("--theta", type=float, help="ICCM vote threshold (default 0.6)")
+    parser.add_argument("--witness-max-nodes", type=int, help="Exact witness node bound (default 18)")
+    parser.add_argument("--witness-max-edges", type=int, help="Exact witness edge bound (default 36)")
     parser.add_argument(
         "--max-candidates-per-behavior",
         type=int,
@@ -113,33 +118,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--taxonomy-version",
-        default="v2",
-        help="Taxonomy version suffix, e.g. v2 -> taxonomy_v2.json",
+        default="v3",
+        help="Taxonomy version suffix, v3 selects taxonomy_v3.json",
     )
     parser.add_argument(
         "--prompt-version",
-        default="v1",
+        default="v2",
         help="Prompt version tag passed to analyzers",
-    )
-    parser.add_argument(
-        "--render-pyvis",
-        action="store_true",
-        help="Render PyVis HTML views after the witness stage finishes",
-    )
-    parser.add_argument(
-        "--pyvis-output-dir",
-        help="Override the visualization output directory (defaults to <artifact-dir>/viz)",
-    )
-    parser.add_argument(
-        "--pyvis-witness-id",
-        action="append",
-        default=[],
-        help="Render only specific witness ids; may be passed multiple times",
-    )
-    parser.add_argument(
-        "--no-pyvis-full-graph",
-        action="store_true",
-        help="Skip the full G_X page and render witness pages only",
     )
     parser.add_argument("--verbose", "-v", action="store_true", help="Verbose logging")
     return parser
@@ -169,6 +154,11 @@ def main() -> None:
     except (FileNotFoundError, ValueError) as exc:
         parser.error(str(exc))
 
+    llm_overrides = {}
+    if args.cache_only: llm_overrides["cache_only"] = True
+    if args.cache_root: llm_overrides["cache_root"] = args.cache_root
+    llm_config = llm_config.model_copy(update=llm_overrides)
+
     base_reconciliation_policy = (
         env_config.reconciliation if env_config is not None else ReconciliationPolicy()
     )
@@ -180,6 +170,8 @@ def main() -> None:
             "max_semantic_event_fallbacks": args.max_semantic_event_fallbacks,
             "max_semantic_path_fallbacks": args.max_semantic_path_fallbacks,
             "overlap_policy_path": args.overlap_policy_path,
+            "witness_max_nodes": args.witness_max_nodes,
+            "witness_max_edges": args.witness_max_edges,
         }.items()
         if value is not None
     }
@@ -189,6 +181,8 @@ def main() -> None:
         if args.n_samples is None
         else base_vote_policy.model_copy(update={"n_samples": args.n_samples})
     )
+    if args.theta is not None:
+        vote_policy = vote_policy.model_copy(update={"agreement_threshold": args.theta})
     analyzer_config = AnalyzerConfig(
         llm=llm_config,
         vote_policy=vote_policy,
@@ -218,6 +212,7 @@ def main() -> None:
         skill_data_root=skill_data_root,
         output_dir=output_dir,
         codeql_bin=codeql_bin,
+        codeql_enabled=not args.native_only,
     )
     reconcile_pipeline = ReconciliationPipeline(
         analyzer_config=analyzer_config,
@@ -294,24 +289,23 @@ def main() -> None:
             paths=paths,
         )
         stage_timings["witness_seconds"] = round(time.time() - stage_started, 3)
-        rendered_paths: list[Path] = []
-        if args.render_pyvis:
-            stage_started = time.time()
-            rendered_paths = render_artifact_dir(
-                artifact_dir=artifact_dir,
-                skill_id=args.skill,
-                output_dir=Path(args.pyvis_output_dir) if args.pyvis_output_dir else None,
-                witness_ids=set(args.pyvis_witness_id),
-                render_full_graph=not args.no_pyvis_full_graph,
-            )
-            stage_timings["pyvis_seconds"] = round(time.time() - stage_started, 3)
         ended_at = time.time()
+        codeql_seconds = json.loads((artifact_dir / "behavior_coverage.json").read_text())["codeql_seconds"]
+        paper_stage_seconds = {
+            "ICCM": contract_pipeline.inference_seconds,
+            "CodeQL": codeql_seconds,
+            "Behavior": stage_timings["behavior_seconds"] - codeql_seconds,
+            "Reconcile": stage_timings["reconciliation_seconds"],
+            "Witness": stage_timings["witness_seconds"],
+        }
+        paper_stage_seconds["I/O + metrics"] = ended_at - started_at - sum(paper_stage_seconds.values())
         _write_runtime_metrics(
             artifact_dir,
             skill_id=args.skill,
             started_at=started_at,
             ended_at=ended_at,
             stage_timings=stage_timings,
+            paper_stage_seconds=paper_stage_seconds,
             llm_model=llm_config.model,
             prompt_version=args.prompt_version,
             taxonomy_version=args.taxonomy_version,
@@ -332,6 +326,9 @@ def main() -> None:
                 "model": llm_config.model,
                 "prompt_version": args.prompt_version,
                 "taxonomy_version": args.taxonomy_version,
+                "analysis_status": json.loads(
+                    (artifact_dir / "behavior_coverage.json").read_text(encoding="utf-8")
+                )["analysis_status"],
             },
         )
     except Exception:
@@ -347,8 +344,6 @@ def main() -> None:
         f"{len(findings)} findings, "
         f"{len(witnesses)} witnesses."
     )
-    if args.render_pyvis:
-        print(f"Rendered {len(rendered_paths)} PyVis HTML files.")
 
 
 def _write_runtime_metrics(
@@ -358,6 +353,7 @@ def _write_runtime_metrics(
     started_at: float,
     ended_at: float,
     stage_timings: dict[str, float],
+    paper_stage_seconds: dict[str, float],
     llm_model: str,
     prompt_version: str,
     taxonomy_version: str,
@@ -370,6 +366,7 @@ def _write_runtime_metrics(
         "ended_at_unix": ended_at,
         "total_seconds": round(ended_at - started_at, 3),
         "stage_seconds": stage_timings,
+        "paper_stage_seconds": paper_stage_seconds,
         "counts": counts,
         "metadata": {
             "model": llm_model,

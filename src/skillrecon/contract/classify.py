@@ -36,15 +36,29 @@ _SENSITIVE_POLICY_CAPABILITIES = {
     "env_var_read",
     "api_key_use",
     "shell_exec",
-    "subprocess_spawn",
+    "subprocess",
     "dynamic_import",
     "sql_exec",
 }
+_DOCUMENT_FORM_RE = re.compile(
+    r"(?i)\bexamples?\b|\bschemas?\b|\breference\b|\bsample\b|"
+    r"\bfeature description\b|\bdefault values?\b|示例|格式说明|参考示例|默认值|特性说明|"
+    r'"why"\s*:|(?:仅|只)?支持[^\n]{0,120}不支持|'
+    r"\bonly supports?\b[^\n]{0,120}\b(?:does not|doesn't) support\b"
+)
+_GOVERNING_EVIDENCE_RE = re.compile(
+    r"(?i)\bmust\b|\bshall\b|\brequired\b|\brequires\b|"
+    r"\bdo not\b|\bnever\b|\ballowed[-_]tools\b|"
+    r"\b(?:is|are)\s+(?:allowed|permitted|authorized|prohibited|forbidden)\b|"
+    r"\b(?:may|can)\s+(?:use|read|write|send|post|fetch|connect|upload|execute|run|delete|install|import)\b|"
+    r"必须|不得|禁止|切勿|不要|仅允许|只能"
+)
 
 
 def classify_clause_roles(
     clauses: list[Clause],
     manifest: PackageManifest,
+    steps=None,
 ) -> list[Clause]:
     """Assign policy/knowledge role to each canonical clause."""
     doc_to_depth = {doc.doc_id: doc.depth for doc in manifest.documents}
@@ -56,7 +70,16 @@ def classify_clause_roles(
 
     classified: list[Clause] = []
     for clause in clauses:
+        if clause.clause_id.startswith('det_'):
+            classified.append(clause.model_copy(update={"role": ClauseRole.POLICY}))
+            continue
         role = infer_clause_role(clause, doc_to_depth, doc_to_path)
+        origins = [step for step in steps or [] if step.step_id in clause.step_ids]
+        if any(step.step_type == "example_code_block" for step in origins):
+            role = ClauseRole.KNOWLEDGE
+        elif any(re.search(r"(?i)permission|prerequisite|requirements?|policy|instructions?|security|privacy|权限|前提|要求|约束|隐私|安全",
+                           step.heading_context) for step in origins):
+            role = ClauseRole.POLICY
         classified.append(clause.model_copy(update={"role": role}))
     return classified
 
@@ -66,43 +89,11 @@ def infer_clause_role(
     doc_to_depth: dict[str, int],
     doc_to_path: dict[str, str],
 ) -> ClauseRole:
-    """Infer whether a clause is policy-bearing or knowledge-bearing."""
-    if clause.operator in {ClauseOperator.ALLOWED, ClauseOperator.PROHIBITED}:
-        return ClauseRole.POLICY
-
-    combined_text = _combined_clause_text(clause)
-    if _ACTION_CUE_RE.search(combined_text) or _NORMATIVE_CUE_RE.search(combined_text):
-        return ClauseRole.POLICY
-
-    source_docs = clause.source_doc_ids
-    root_sourced = any(doc_to_depth.get(doc_id, 0) == 0 for doc_id in source_docs)
-    path_hints = [doc_to_path.get(doc_id, "") for doc_id in source_docs]
-    has_specific_surface = bool(clause.target) or any(
-        constraint.constraint_type.lower() != "scope" or len(constraint.value.strip()) >= 8
-        for constraint in clause.constraints
-    )
-    has_operational_policy = _OPERATIONAL_POLICY_CUE_RE.search(combined_text) is not None
-    is_sensitive_policy_candidate = clause.capability in _SENSITIVE_POLICY_CAPABILITIES
-
-    if not root_sourced and not (
-        is_sensitive_policy_candidate and has_specific_surface and has_operational_policy
-    ):
-        return ClauseRole.KNOWLEDGE
-
-    if _KNOWLEDGE_CUE_RE.search(combined_text) and not (
-        is_sensitive_policy_candidate and has_specific_surface and has_operational_policy
-    ):
-        return ClauseRole.KNOWLEDGE
-
-    if "|" in combined_text and not (
-        is_sensitive_policy_candidate and has_specific_surface and has_operational_policy
-    ):
-        return ClauseRole.KNOWLEDGE
-
-    if any(_WORKFLOW_PATH_HINT_RE.search(path) for path in path_hints if path):
-        return ClauseRole.POLICY
-
-    return ClauseRole.POLICY
+    """An extracted operator cannot turn descriptive prose into policy."""
+    evidence_text = " ".join(span.text for span in clause.evidence_spans)
+    prose = re.sub(r"\x60[^\x60]*\x60", " ", evidence_text)
+    governing = bool(_GOVERNING_EVIDENCE_RE.search(prose) or _ACTION_CUE_RE.match(prose.strip()))
+    return ClauseRole.POLICY if governing else ClauseRole.KNOWLEDGE
 
 
 def _combined_clause_text(clause: Clause) -> str:

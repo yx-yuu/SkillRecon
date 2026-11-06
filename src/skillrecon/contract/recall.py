@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from collections import defaultdict
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 
 from skillrecon.core.enums import ClauseOperator, ClauseRole
 from skillrecon.core.sensitivity import event_requires_authorization
@@ -17,7 +17,8 @@ from skillrecon.core.types import (
     ResourceUse,
     Step,
 )
-from skillrecon.reconcile.predicate import _resource_matches_clause
+from skillrecon.reconcile.predicate import _resource_matches_clause, load_overlap_policy
+from skillrecon.core.config import PROJECT_ROOT
 
 _TOKEN_RE = re.compile(r"[a-z0-9]+")
 _STOPWORDS = {
@@ -69,10 +70,10 @@ _CAPABILITY_HINTS: dict[str, tuple[str, ...]] = {
     "http_request": ("http", "https", "request", "api", "fetch"),
     "smtp_send": ("smtp", "email", "mail", "send"),
     "shell_exec": ("shell", "command", "bash", "run", "execute"),
-    "subprocess_spawn": ("subprocess", "process", "spawn", "run"),
+    "subprocess": ("subprocess", "process", "spawn", "run"),
     "dynamic_import": ("import", "module", "plugin", "package"),
     "env_var_read": ("env", "environment", "variable", "secret", "token"),
-    "data_encode_send": ("upload", "send", "export", "post", "submit"),
+    "data_encode": ("upload", "send", "export", "post", "submit"),
     "ssh_connect": ("ssh", "remote", "connect"),
     "sql_exec": ("sql", "query", "database"),
 }
@@ -124,7 +125,7 @@ def select_recall_blocks(
         for event, query_tokens, linked_docs in event_queries:
             shared = block_tokens & query_tokens
             if shared:
-                score += min(len(shared), 5)
+                score += 5
                 matched_caps.add(event.capability)
             if block.doc_id in linked_docs:
                 score += 6
@@ -191,6 +192,8 @@ def select_recall_steps(
 
     scored_steps: list[tuple[int, int, str, int, Step]] = []
     for step in steps:
+        if step.step_type == "frontmatter":
+            continue
         step_tokens = _step_tokens(step)
         if not step_tokens:
             continue
@@ -199,7 +202,7 @@ def select_recall_steps(
         for event, query_tokens, linked_docs in event_queries:
             shared = step_tokens & query_tokens
             if shared:
-                score += min(len(shared), 5)
+                score += 5
                 matched_caps.add(event.capability)
             if step.doc_id in linked_docs:
                 score += 6
@@ -236,8 +239,11 @@ def select_recall_events(
     resources: list[ResourceUse],
     clauses: list[Clause],
     a_req: set[str],
+    overlap_map: dict[str, set[str]] | None = None,
 ) -> list[CapabilityEvent]:
     """Keep only sensitive events that lack explicit policy coverage."""
+    if overlap_map is None:
+        overlap_map = load_overlap_policy(PROJECT_ROOT / "experiments/configs/overlap_policy_v2.json")
     sensitive_events = [event for event in events if event_requires_authorization(event, a_req)]
     if not sensitive_events:
         return []
@@ -251,7 +257,6 @@ def select_recall_events(
         clause
         for clause in clauses
         if clause.role == ClauseRole.POLICY
-        and clause.operator in {ClauseOperator.ALLOWED, ClauseOperator.PROHIBITED}
     ]
     selected: list[CapabilityEvent] = []
     seen_signatures: set[tuple[str, tuple[str, ...]]] = set()
@@ -260,6 +265,7 @@ def select_recall_events(
             event,
             resources_by_event.get(event.event_id, []),
             explicit_policy_clauses,
+            overlap_map,
         ):
             continue
         signature = _recall_event_signature(
@@ -326,7 +332,6 @@ def merge_recall_clauses(
     *,
     existing_clauses: list[Clause],
     recall_clauses: list[Clause],
-    target_capabilities: set[str],
 ) -> list[Clause]:
     """Merge targeted recall clauses into an existing contract table."""
     existing_keys = {_recall_clause_key(clause) for clause in existing_clauses}
@@ -334,8 +339,6 @@ def merge_recall_clauses(
     accepted: list[Clause] = []
 
     for clause in recall_clauses:
-        if clause.capability not in target_capabilities:
-            continue
         if clause.role != ClauseRole.POLICY:
             continue
         if clause.operator.value == "unknown":
@@ -390,18 +393,12 @@ def _event_has_explicit_policy(
     event: CapabilityEvent,
     resources: list[ResourceUse],
     clauses: list[Clause],
+    overlap_map: dict[str, set[str]],
 ) -> bool:
     for clause in clauses:
-        if clause.capability != event.capability:
+        if event.capability not in {clause.capability, *overlap_map.get(clause.capability, set())}:
             continue
-        if not clause.target and not clause.constraints:
-            return True
-        resolved_resources = [resource for resource in resources if resource.resolved]
-        if resolved_resources and any(
-            _resource_matches_clause(clause, resource)
-            for resource in resolved_resources
-        ):
-            return True
+        return True
     return False
 
 
@@ -448,7 +445,7 @@ def _policy_cue_score(block: DocBlock) -> int:
 
 def _policy_text_score(*parts: str) -> int:
     text = " ".join(part for part in parts if part).lower()
-    return sum(2 for cue in _POLICY_CUES if cue in text)
+    return 2 if any(cue in text for cue in _POLICY_CUES) else 0
 
 
 def _recall_clause_key(clause: Clause) -> tuple[object, ...]:

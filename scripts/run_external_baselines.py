@@ -14,7 +14,6 @@ from pathlib import Path
 
 from skillrecon.evaluation.datasets import (
     BaselinePredictionRecord,
-    flatten_paper_sample_records,
     write_jsonl_models,
 )
 from skillrecon.evaluation.external_scanners import (
@@ -24,6 +23,7 @@ from skillrecon.evaluation.external_scanners import (
     get_external_scanner_spec,
     list_external_scanner_specs,
     load_external_scanner_payload,
+    load_malskills_payload,
 )
 
 
@@ -49,6 +49,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--skill-id", help="Single skill id for --skill-path.")
     parser.add_argument("--skill-path", help="Single skill source directory or SKILL.md.")
+    parser.add_argument("--scanner-config", type=Path, help="Native MalSkills full-profile TOML, including the chosen GLM/DeepSeek/Qwen provider")
+    parser.add_argument("--scanner-python", type=Path, help="Python with native MalSkills installed; defaults to the current interpreter for its full profile")
+    parser.add_argument("--scanner-arg", action="append", default=[], help="Append an argument to the recorded native command; repeat as needed")
     parser.add_argument(
         "--raw-json",
         action="append",
@@ -58,45 +61,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "skill_id=/path/to/raw.json. Can be repeated."
         ),
     )
-    parser.add_argument(
-        "--reviewer-cases",
-        help="Reviewer case config, for example experiments/configs/reviewer_cases_v1.json.",
-    )
-    parser.add_argument(
-        "--reviewer-source-root",
-        default="data/skill_dataset",
-        help="Root containing reviewer case source_relpath directories.",
-    )
-    parser.add_argument(
-        "--paper-dataset",
-        help="Paper sample dataset root containing high/medium/low sample_index.jsonl.",
-    )
-    parser.add_argument(
-        "--artifact-root",
-        help=(
-            "Optional SkillRecon artifact root. When the original skill source "
-            "path is unavailable, use <artifact-root>/<owner>/<slug>/staged_source."
-        ),
-    )
-    parser.add_argument(
-        "--data-root",
-        default="data/skill_dataset",
-        help="Fallback local skill dataset root for resolving paper sample records.",
-    )
-    parser.add_argument(
-        "--drive-map",
-        action="append",
-        default=[],
-        help="Windows drive mapping for sample indexes, for example E=/mnt/e.",
-    )
+    parser.add_argument("--skills-file", type=Path, help="One skill identity per line")
+    parser.add_argument("--data-root", type=Path, default=Path("data/packages"))
     parser.add_argument(
         "--limit",
         type=int,
-        help="Limit number of scan targets, useful for smoke runs.",
+        help="Limit number of scan targets, useful for a selected subset.",
     )
     parser.add_argument(
         "--output-dir",
-        default="derived/external_baselines",
+        default="outputs/external-baselines",
         help="Output directory for raw scanner files, normalized reports, and predictions.",
     )
     parser.add_argument(
@@ -149,7 +123,11 @@ def main() -> None:
     failures: list[dict[str, str]] = []
 
     for target in targets:
-        raw_output = target.raw_json or raw_dir / f"{_safe_name(target.skill_id)}.json"
+        raw_output = target.raw_json or (
+            raw_dir / _safe_name(target.skill_id) / "verdict.json"
+            if spec.command_kind in {"malskills_static", "malskills_full"}
+            else raw_dir / f"{_safe_name(target.skill_id)}.json"
+        )
         scan_skill_path = (
             None
             if target.raw_json is not None or target.skill_path is None
@@ -166,8 +144,15 @@ def main() -> None:
                 spec,
                 skill_path=scan_skill_path,
                 output_path=raw_output,
+                scanner_config=args.scanner_config,
             )
         )
+        if command is not None:
+            command.extend(args.scanner_arg)
+            if spec.command_kind == "malskills_full":
+                command = [str(args.scanner_python or sys.executable),
+                           str(Path(__file__).with_name("run_malskills_native.py")),
+                           "--trace",str(raw_output.parent / "native_execution.jsonl"),*command[1:]]
         planned.append(
             {
                 "skill_id": target.skill_id,
@@ -191,7 +176,7 @@ def main() -> None:
                 if not args.continue_on_error:
                     break
                 continue
-            if executable is None:
+            if executable is None and spec.command_kind != "malskills_full":
                 message = f"{spec.executable!r} is not installed; {spec.install_hint}"
                 if args.allow_missing_scanner:
                     skipped.append({"skill_id": target.skill_id, "reason": message})
@@ -211,7 +196,10 @@ def main() -> None:
                 continue
 
         try:
-            payload = load_external_scanner_payload(raw_output)
+            payload = (
+                load_malskills_payload(raw_output, require_full=spec.command_kind == "malskills_full") if spec.command_kind in {"malskills_static", "malskills_full"}
+                else load_external_scanner_payload(raw_output)
+            )
             raw_ref = os.path.relpath(raw_output, Path.cwd())
             prediction = external_scanner_payload_to_prediction(
                 skill_id=target.skill_id,
@@ -231,7 +219,7 @@ def main() -> None:
                 report.model_dump_json(indent=2) + "\n",
                 encoding="utf-8",
             )
-        except Exception as exc:  # pragma: no cover - defensive CLI boundary
+        except Exception as exc: 
             failures.append({"skill_id": target.skill_id, "error": str(exc)})
             if not args.continue_on_error:
                 break
@@ -250,8 +238,11 @@ def main() -> None:
         "failures": failures,
         "predictions_out": str(prediction_path),
         "output_dir": str(output_dir),
-        "commands": planned if args.dry_run else planned[:5],
+        "commands": planned,
     }
+    (output_dir / "run_summary.json").write_text(
+        json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     if failures and not args.continue_on_error:
         raise SystemExit(1)
@@ -264,22 +255,9 @@ def _collect_targets(args: argparse.Namespace) -> list[ScanTarget]:
         if not args.skill_id:
             raise SystemExit("--skill-id is required with --skill-path")
         targets.append(ScanTarget(skill_id=args.skill_id, skill_path=Path(args.skill_path)))
-    if args.reviewer_cases:
-        targets.extend(
-            _reviewer_case_targets(
-                Path(args.reviewer_cases),
-                source_root=Path(args.reviewer_source_root),
-            )
-        )
-    if args.paper_dataset:
-        targets.extend(
-            _paper_dataset_targets(
-                Path(args.paper_dataset),
-                data_root=Path(args.data_root),
-                drive_map=_parse_drive_map(args.drive_map),
-                artifact_root=Path(args.artifact_root) if args.artifact_root else None,
-            )
-        )
+    if args.skills_file:
+        targets.extend(ScanTarget(skill_id=line.strip(), skill_path=args.data_root/line.strip())
+                       for line in args.skills_file.read_text().splitlines() if line.strip())
     return _dedupe_targets(targets)
 
 
@@ -295,55 +273,10 @@ def _parse_raw_json_targets(items: list[str]) -> list[ScanTarget]:
     return targets
 
 
-def _reviewer_case_targets(path: Path, *, source_root: Path) -> list[ScanTarget]:
-    payload = json.loads(path.read_text(encoding="utf-8"))
-    targets: list[ScanTarget] = []
-    for item in payload:
-        skill_id = item.get("skill_id")
-        source_relpath = item.get("source_relpath")
-        if not isinstance(skill_id, str) or not isinstance(source_relpath, str):
-            continue
-        targets.append(
-            ScanTarget(
-                skill_id=skill_id,
-                skill_path=source_root / source_relpath,
-            )
-        )
-    return targets
 
 
-def _paper_dataset_targets(
-    dataset_root: Path,
-    *,
-    data_root: Path,
-    drive_map: dict[str, str],
-    artifact_root: Path | None = None,
-) -> list[ScanTarget]:
-    targets: list[ScanTarget] = []
-    for record in flatten_paper_sample_records(dataset_root):
-        skill_path = record.resolve_skill_path(
-            data_root,
-            windows_drive_map=drive_map,
-        )
-        staged_source = (
-            artifact_root / record.owner / record.slug / "staged_source"
-            if artifact_root is not None
-            else None
-        )
-        if staged_source is not None and staged_source.exists() and not skill_path.exists():
-            skill_path = staged_source
-        targets.append(ScanTarget(skill_id=record.skill_id, skill_path=skill_path))
-    return targets
 
 
-def _parse_drive_map(items: list[str]) -> dict[str, str]:
-    parsed: dict[str, str] = {}
-    for item in items:
-        drive, sep, root = item.partition("=")
-        if not sep or not drive or not root:
-            raise SystemExit(f"Invalid --drive-map value {item!r}; expected E=/mnt/e")
-        parsed[drive.upper().rstrip(":")] = root
-    return parsed
 
 
 def _dedupe_targets(targets: list[ScanTarget]) -> list[ScanTarget]:
@@ -371,6 +304,8 @@ def _run_scanner_command(
         capture_output=True,
         text=True,
     )
+    output_path.with_suffix(".stdout.log").write_text(result.stdout,encoding="utf-8")
+    output_path.with_suffix(".stderr.log").write_text(result.stderr,encoding="utf-8")
     if result.returncode not in success_exit_codes:
         raise RuntimeError(
             f"scanner exited with {result.returncode}: {result.stderr.strip()}"

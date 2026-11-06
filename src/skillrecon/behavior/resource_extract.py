@@ -5,6 +5,9 @@ from __future__ import annotations
 import re
 from pathlib import PurePosixPath
 
+from tree_sitter import Language, Parser
+import tree_sitter_bash
+
 _URL_RE = re.compile(r"https?://[^\s'\"`]+")
 _ENV_CALL_RE = re.compile(
     r"""(?:getenv\(\s*['"]|environ\[['"])([A-Z_][A-Z0-9_]*)"""
@@ -12,6 +15,7 @@ _ENV_CALL_RE = re.compile(
 _JS_ENV_RE = re.compile(r"""process\.env(?:\.|\[['"])([A-Z_][A-Z0-9_]*)""")
 _BASH_ENV_RE = re.compile(r"""\$\{?([A-Z_][A-Z0-9_]*)\}?""")
 _QUOTED_PATH_RE = re.compile(r"""['"]((?:~|/|\.\.?/)[^'"]+)['"]""")
+_SHELL_VARIABLE_PATH_RE = re.compile(r"""(['"])(\$(?:[A-Za-z_][A-Za-z0-9_]*|\{[^}]+\})/[^'"]*)\1""")
 _QUOTED_FILE_RE = re.compile(
     r"""['"]([A-Za-z0-9_.-]+\.(?:py|js|ts|sh|json|ya?ml|md|txt|html|csv|xml|sql|log|cfg|ini))['"]"""
 )
@@ -30,7 +34,7 @@ _SUBPROCESS_RE = re.compile(
     r"""\b(?:subprocess\.(?:run|Popen|call|check_call|check_output)|
     child_process\.(?:spawn|execFile|fork)|
     execa\(|spawn\(|execFile\()""",
-    re.VERBOSE,
+    re.VERBOSE | re.IGNORECASE,
 )
 _FILE_LIKE_SUFFIXES = {
     ".py",
@@ -63,6 +67,9 @@ def _extract_resources(
     source_line: str,
     detail: str,
     capability: str,
+    *,
+    language: str,
+    environment_names: list[str] | None = None,
 ) -> list[tuple[str, str, bool, str, str]]:
     resources: list[tuple[str, str, bool, str, str]] = []
     seen: set[tuple[str, str]] = set()
@@ -73,18 +80,24 @@ def _extract_resources(
         return _abstract_resources_for_capability(capability)
 
     for text in texts:
-        for value in _URL_RE.findall(text):
+        for match in _URL_RE.finditer(text):
+            value = match.group().rstrip(".,);")
             _append_resource(
                 resources,
                 seen,
                 "url",
-                value.rstrip(".,);"),
-                True,
+                value,
+                _literal_is_resolved(value, language, single_quoted=match.start() > 0 and text[match.start() - 1] == "'"),
                 "literal",
                 "url_literal",
             )
 
-        for regex in (_ENV_CALL_RE, _JS_ENV_RE, _BASH_ENV_RE):
+        regexes = {"python": (_ENV_CALL_RE,), "javascript": (_JS_ENV_RE,),
+                   "typescript": (_JS_ENV_RE,), "bash": (_BASH_ENV_RE,),
+                   "markdown": (_ENV_CALL_RE, _JS_ENV_RE, _BASH_ENV_RE)}.get(language, ())
+        for regex in regexes:
+            if language == "bash" and environment_names is not None:
+                continue
             for value in regex.findall(text):
                 _append_resource(
                     resources,
@@ -96,16 +109,22 @@ def _extract_resources(
                     "environment_variable",
                 )
 
-        for value in _QUOTED_PATH_RE.findall(text):
+        for match in _QUOTED_PATH_RE.finditer(text):
+            value = match.group(1)
             _append_resource(
                 resources,
                 seen,
                 "path",
                 value,
-                True,
+                _literal_is_resolved(value, language, single_quoted=match.group()[0] == "'"),
                 _path_origin_kind(value),
                 value,
             )
+
+        if language == "bash" and capability in {"file_read", "file_write", "file_delete", "file_permission_change", "token_file_read"}:
+            for value, resolved in shell_variable_paths(text):
+                _append_resource(resources, seen, "path", value, resolved,
+                                 "literal" if resolved else "unknown", "shell_variable_path")
 
         for value in _QUOTED_FILE_RE.findall(text):
             _append_resource(
@@ -119,12 +138,14 @@ def _extract_resources(
             )
 
         for value in _REDIRECT_RE.findall(text):
+            single_quoted = value.startswith("'")
+            value = value.strip("\"'")
             _append_resource(
                 resources,
                 seen,
                 "path",
                 value,
-                True,
+                _literal_is_resolved(value, language, single_quoted=single_quoted),
                 "artifact",
                 "shell_redirect",
             )
@@ -152,9 +173,27 @@ def _extract_resources(
                     value,
                 )
 
+    for value in environment_names or []:
+        dynamic = value == "<dynamic-env-var>"
+        _append_resource(resources, seen, "env_var", value, not dynamic,
+                         "unknown" if dynamic else "env", "environment_variable")
+    if capability == "env_var_read":
+        resources = [item for item in resources if item[0] == "env_var"]
     if resources:
         return resources
     return _abstract_resources_for_capability(capability)
+
+
+def _literal_is_resolved(value: str, language: str, *, single_quoted: bool = False) -> bool:
+    """Shell expansions are expressions, while single quotes preserve literals."""
+    if language == "bash" and not single_quoted:
+        return re.search(r"(?<!\\)(?:\$|`)", value) is None
+    return True
+
+
+def shell_variable_paths(text: str) -> list[tuple[str, bool]]:
+    """Keep variable-prefixed file targets with their actual quote semantics."""
+    return [(m.group(2), m.group(1) == "'") for m in _SHELL_VARIABLE_PATH_RE.finditer(text)]
 
 
 def _append_resource(
@@ -233,14 +272,14 @@ def _abstract_resources_for_capability(capability: str) -> list[tuple[str, str, 
         "websocket",
         "smtp_send",
         "ssh_connect",
-        "data_encode_send",
+        "data_encode",
     }:
         return [("url", "<dynamic-url>", False, "unknown", "dynamic_url")]
     if capability in {"file_read", "file_write", "token_file_read"}:
         return [("path", "<dynamic-path>", False, "unknown", "dynamic_path")]
     if capability == "env_var_read":
         return [("env_var", "<dynamic-env-var>", False, "unknown", "dynamic_env_var")]
-    if capability in {"shell_exec", "subprocess_spawn"}:
+    if capability in {"shell_exec", "subprocess", "eval_exec"}:
         return [("command", "<dynamic-command>", False, "unknown", "dynamic_command")]
     if capability == "sql_exec":
         return [("query", "<dynamic-query>", False, "unknown", "dynamic_query")]
@@ -250,10 +289,52 @@ def _abstract_resources_for_capability(capability: str) -> list[tuple[str, str, 
 def _refine_capability(capability: str, source_line: str, detail: str) -> str:
     if capability != "shell_exec":
         return capability
+    if detail == "eval" and _shell_eval_executes_command(source_line):
+        return "eval_exec"
     text = f"{source_line}\n{detail}".lower()
     if _SUBPROCESS_RE.search(text):
-        return "subprocess_spawn"
+        return "subprocess"
     return capability
+
+
+def _shell_eval_executes_command(source: str) -> bool:
+    """Distinguish eval command execution from Shell indirect assignments.
+
+    Parse the eval arguments twice, as Shell does. Dynamic expansions become
+    symbolic words; escaped expansions remain in the second-pass syntax.
+    This classifies the operation without executing the input.
+    """
+    parser = Parser(Language(tree_sitter_bash.language()))
+
+    def walk(node):
+        yield node
+        for child in node.named_children:
+            yield from walk(child)
+
+    def argument_text(node) -> str:
+        text = node.text.decode()
+        if node.type in {"simple_expansion", "expansion"}:
+            return "__value"
+        if node.type == "raw_string":
+            return text[1:-1]
+        if node.type in {"string", "concatenation"}:
+            return "".join(argument_text(child) for child in node.named_children)
+        return re.sub(r'\\([$`"\\\n])', lambda match: "" if match[1] == "\n" else match[1], text)
+
+    for command in walk(parser.parse(source.encode()).root_node):
+        if command.type != "command":
+            continue
+        name = command.child_by_field_name("name")
+        if name is None or name.text != b"eval":
+            continue
+        arguments = command.children_by_field_name("argument")
+        if any(node.type == "command_substitution" for arg in arguments for node in walk(arg)):
+            return True
+        body = " ".join(argument_text(arg) for arg in arguments)
+        evaluated = parser.parse(body.encode()).root_node
+        if any(node.type in {"command", "command_substitution"} for node in walk(evaluated)):
+            return True
+    return False
 
 
 def _path_origin_kind(value: str) -> str:
